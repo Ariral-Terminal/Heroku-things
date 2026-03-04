@@ -1,5 +1,12 @@
-<blockquote><emoji document_id=5375055874777702206>🚗</emoji><b> Heroku <code>{version} {build}</code> with <code>{branch}</code> branch running on <code>{hostname} {os}</code>
-
-<emoji document_id=5373056919688731596>📷</emoji><b> Owner is </b><code>{me}</code> <b>running with python</b> <code>{python_ver}</code> <b>and also </b><code>{htl_ver}</code> <b>htl version!</b>
-
-<emoji document_id=5296482716567495148>⌛️</emoji><b> Date is </b><code>{date}</code>, <code>{time}</code></blockquote>
+<tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji>
+<tg-emoji emoji-id=5456178297941561360>🌘</tg-emoji><b>User:</b> <code>{me}</code>
+<tg-emoji emoji-id=5458396206168312985>🌘</tg-emoji><b>Bot:<b> <code>{version}</code> • <code>{branch}</code> • <code>{build}</code>
+<tg-emoji emoji-id=5458805877328875335>🌘</tg-emoji><b>System<b> <code>{os}</code> • <code>{kernel}</code>
+<tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji>
+<tg-emoji emoji-id=5458893559086223367>🌘</tg-emoji><b>Status</b> <code>{git_status}</code> • <code>{upd}</code>
+<tg-emoji emoji-id=5456591761558245861>🌘</tg-emoji><b>Uptime:</b> <code>{uptime}</code> • <code>{ping}</code> <b>ms</b>
+<tg-emoji emoji-id=5456496628032640333>🌘</tg-emoji><b>Prefix:</b> <code>{prefix}</code>
+<tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji>
+<tg-emoji emoji-id=5458777285731583447>🌘</tg-emoji> <b><u>HW</u>:</b> <b>CPU</b> - <code>{cpu_usage}</code>% • <b>RAM</b> - <code>{ram_usage}</code>% • <b>CPU:</b> <code>{cpu}</code>
+<tg-emoji emoji-id=5456377666028475277>🌘</tg-emoji> <b>Python:</b> <code>{python_ver}</code><b>• HTL:</b> <code>{htl_ver}</code>
+<tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji><tg-emoji emoji-id=5424894005265581568>🤍</tg-emoji>
