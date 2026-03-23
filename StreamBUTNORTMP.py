@@ -1,4 +1,4 @@
-# meta developer: @desertedowl
+# meta developer: @desertedowl / origin: @fiks_official
 # meta version: 2.0.0
 # meta name: StreamNoRTMP
 # requires: ffmpeg hikkals
