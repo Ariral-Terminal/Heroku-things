@@ -1,0 +1,434 @@
+"""
+    📦 GitHubManager - Управление репозиториями через GitHub API
+    
+    Этот модуль позволяет загружать (обновлять) файлы в указанный репозиторий GitHub
+    с помощью REST API и персонального токена.
+    
+"""
+
+__version__ = (6, 3, 10) 
+
+# meta developer: @sxozuo forked by @desertedowl
+# requires: aiohttp
+
+import contextlib
+import aiohttp
+import base64
+import logging
+import json
+import re
+from typing import Optional, Any
+
+from .. import loader, utils
+from herokutl.types import Message
+
+logger = logging.getLogger(__name__)
+
+# URL для GitHub Content API: /repos/{owner}/{repo}/contents/{path}
+GITHUB_API_URL = "https://api.github.com/repos/{owner}/{repo}/contents/{path}"
+# Регулярное выражение для поиска префикса диска Windows (e: , c: и т.д.)
+WINDOWS_DRIVE_PREFIX_REGEX = re.compile(r"^[a-zA-Z]:")
+
+@loader.tds
+class GitHubManagerMod(loader.Module):
+    """Управление файлами в репозиториях GitHub"""
+    
+    strings = {
+        "name": "GitHubManager",
+        "no_config": "❌ <b>Ошибка:</b> Пожалуйста, настройте <code>github_token</code> в конфиге модуля.",
+        "no_repo_set": "❌ <b>Ошибка:</b> Репозиторий по умолчанию не установлен. Пожалуйста, укажите <code>repo_owner</code> и <code>repo_name</code> в конфиге модуля.",
+        "no_reply": "❌ <b>Ошибка:</b> Ответьте на сообщение с файлом, который нужно загрузить.",
+        "api_error": "❌ <b>GitHub API Ошибка (HTTP {status}):</b> {error}",
+        "internal_error": "❌ <b>Внутренняя Ошибка:</b> {}",
+        "no_filename": "❌ <b>Ошибка:</b> Не удалось определить имя файла из сообщения. Убедитесь, что это документ или медиафайл.",
+        "downloading": "⏳ Скачиваю файл...",
+        "uploading": "⏳ Загружаю файл в репозиторий <code>{owner}/{repo}</code> по пути <code>{path}</code>...",
+        "success_create": "✅ <b>Файл создан:</b> <code>{path}</code>\nURL: {url}",
+        "success_update": "✅ <b>Файл обновлен:</b> <code>{path}</code>\nURL: {url}",
+        "files_list_header": "📄 <b>Файлы в репозитории <code>{owner}/{repo}</code></b>\nПуть: <code>{path}</code>\nСтраница <code>{page}</code>/<code>{total_pages}</code> · <code>{per_page}</code> файлов на страницу.",
+        "files_list_empty": "ℹ️ <b>Файлы не найдены.</b>\nРепозиторий или выбранный путь не содержит файлов.",
+        "files_list_truncated": "⚠️ <b>Показано только часть списка.</b>",
+        "files_list_path_error": "❌ <b>Ошибка:</b> Не удалось получить список файлов для пути: <code>{path}</code>.",
+        "files_list_bad_page": "❌ <b>Ошибка:</b> Такой страницы не существует.",
+        "files_list_bad_per_page": "❌ <b>Ошибка:</b> <code>files_per_list</code> должен быть положительным числом.",
+        "files_list_next": "След.",
+        "files_list_prev": "Назад",
+        "files_list_close": "❌ Закрыть",
+        "repo_set_success": "✅ <b>Репозиторий установлен:</b> <code>{owner}/{repo}</code>",
+        "repo_list_header": "📁 <b>Ваши репозитории на GitHub:</b>\nВыберите репозиторий, который нужно установить по умолчанию для загрузки (<code>.ghupload</code>).",
+        "no_repos": "❌ Не удалось найти репозитории, доступные для токена, или список пуст.",
+        "info_guide": (
+            "🚀 <b>Гайд по модулю GitHubManager</b>\n\n"
+            "Этот модуль позволяет загружать файлы в ваш репозиторий GitHub.\n\n"
+            "### ⚙️ Настройка (Обязательно)\n"
+            "1. Получите Персональный Токен (PAT) на GitHub с правами <code>repo</code>.\n"
+            "2. **Установите в конфиге модуля следующие параметры:**\n"
+            "    - <code>github_token</code>: Ваш PAT.\n"
+            "    - <code>repo_owner</code>: Владелец целевого репозитория (например, <code>sxozuo</code>).\n"
+            "    - <code>repo_name</code>: Имя целевого репозитория (например, <code>userbot_files</code>).\n\n"
+            "### 💾 Использование\n"
+            "Команда: <code>ghupload</code> [сообщение коммита]\n"
+            "<b>Действие:</b> Ответьте этой командой на сообщение с файлом.\n"
+            "    - Файл будет загружен или обновлен (если уже существует).\n"
+            "    - <b>[сообщение коммита]</b> — опционально. Если не указано, используется имя файла.\n\n"
+            "Команда: <code>ghfiles</code> [путь]\n"
+            "<b>Действие:</b> Показывает список файлов в репозитории в виде копируемых <code>...</code> строк.\n"
+            "    - <b>[путь]</b> — опционально. Можно указать папку или файл.\n"
+            "    - Размер страницы задается в конфиге <code>files_per_list</code>.\n\n"
+            "<b>✨ Новая команда:</b> <code>ghrepos</code> для интерактивного выбора репозитория."
+        ),
+        "update_start": "📂 <b>Выберите файл для обновления</b> в репозитории <code>{owner}/{repo}</code> по пути <code>{path}</code>:",
+        "update_path": "📂 <b>Содержимое:</b> <code>{path}</code>",
+        "update_prompt": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь ответьте на сообщение с новым файлом и введите сообщение коммита.",
+        "update_no_path": "❌ <b>Ошибка:</b> Не удалось получить список файлов для пути: <code>{path}</code>.",
+        "update_back": "⬅️ Назад",
+        "update_cancel": "❌ Отмена",
+        "user_id_error": "❌ Внутренняя ошибка: Не удалось определить ID пользователя, нажавшего кнопку. Проверьте логи.",
+        "update_timeout": "❌ <b>Ошибка:</b> Режим обновления файла не активен. Сначала используйте <code>.ghupdatecmd</code> без аргументов и выберите файл.",
+        "delete_start": "🗑 <b>Выберите файл для удаления</b> в репозитории <code>{owner}/{repo}</code>\nПуть: <code>{path}</code>",
+        "delete_confirm": "⚠️ <b>Удалить файл?</b>\n<code>{path}</code>\nРепозиторий: <code>{owner}/{repo}</code>",
+        "delete_btn_confirm": "✅ Удалить",
+        "delete_btn_cancel": "❌ Отмена",
+        "success_delete": "🗑 <b>Файл удалён:</b> <code>{path}</code>",
+        "delete_not_found": "❌ <b>Файл не найден:</b> <code>{path}</code>",
+    }
+
+    def __init__(self):
+        self.config = loader.ModuleConfig(
+            loader.ConfigValue(
+                "github_token",
+                "",
+                "Персональный токен GitHub (PAT) с правами 'repo'",
+                validator=loader.validators.Hidden()
+            ),
+            loader.ConfigValue(
+                "repo_owner",
+                "",
+                "Владелец репозитория (устанавливается только через конфиг)",
+                validator=loader.validators.String()
+            ),
+            loader.ConfigValue(
+                "repo_name",
+                "",
+                "Название репозитория (устанавливается только через конфиг)",
+                validator=loader.validators.String()
+            ),
+            loader.ConfigValue(
+                "files_per_list",
+                25,
+                "Максимум файлов на одну страницу в ghfiles",
+                validator=loader.validators.String()
+            ),
+        )
+
+    async def client_ready(self, client, db):
+        self._client = client
+        self._db = db
+        self.session: Optional[aiohttp.ClientSession] = None
+        self.temp_update_path = {}
+        # Pre-stored reply message when user calls .ghupdate as reply to a file
+        self.temp_update_reply: dict = {}
+    async def on_unload(self):
+        if self.session and not self.session.closed:
+            await self.session.close()
+
+    async def _ensure_session(self):
+        """Создает или пересоздает асинхронную сессию aiohttp с актуальным токеном."""
+        if self.session and not self.session.closed:
+            return
+        
+        token = self.config['github_token'].strip()
+        if not token:
+            self.session = None
+            return
+        
+        headers = {
+            "Authorization": f"token {token}",
+            "Accept": "application/vnd.github.v3+json",
+            "User-Agent": "Heroku-UserBot-GitHubManager",
+        }
+        self.session = aiohttp.ClientSession(
+            headers=headers,
+            timeout=aiohttp.ClientTimeout(total=30)
+        )
+
+    # --- Утилиты ID ---
+    def _find_id_recursively(self, obj: Any, visited: set) -> Optional[int]:
+        """Рекурсивно ищет целое число, которое может быть ID пользователя."""
+        
+        if obj is None or obj in visited:
+            return None
+        visited.add(obj)
+        
+        try:
+            if isinstance(obj, int) and obj > 0:
+                return obj
+            
+            if isinstance(obj, dict):
+                for key, value in obj.items():
+                    if isinstance(key, str) and ('user' in key or 'from' in key or 'sender' in key or key == 'id'):
+                        if isinstance(value, int) and value > 0:
+                            return value
+                    result = self._find_id_recursively(value, visited)
+                    if result is not None:
+                        return result
+
+            if isinstance(obj, (list, tuple)):
+                for item in obj:
+                    result = self._find_id_recursively(item, visited)
+                    if result is not None:
+                        return result
+            
+            if hasattr(obj, '__dict__'):
+                for key, value in vars(obj).items():
+                    if 'id' in key:
+                         if isinstance(value, int) and value > 0:
+                            return value
+                    
+                    result = self._find_id_recursively(value, visited)
+                    if result is not None:
+                        return result
+                        
+        except Exception:
+            pass
+            
+        return None
+
+    def _get_user_id_from_call(self, call: Message) -> Optional[int]:
+        """Пытается получить ID пользователя из объекта InlineCall, используя все известные атрибуты и глубокий поиск."""
+        
+        # 1. Прямые атрибуты (наиболее часто используемые)
+        for attr in ['from_id', 'sender_id', 'user_id']:
+            if hasattr(call, attr) and isinstance(getattr(call, attr), int) and getattr(call, attr) > 0:
+                # ✅ ИСПРАВЛЕНИЕ ОШИБКИ: заменена ] на )
+                return getattr(call, attr)
+        
+        # 2. Атрибут 'sender'
+        if hasattr(call, 'sender') and hasattr(call.sender, 'id') and isinstance(call.sender.id, int) and call.sender.id > 0:
+            return call.sender.id
+            
+        # 3. Аварийный глубокий рекурсивный поиск
+        return self._find_id_recursively(call, set())
+
+    # --- Конец Утилит ID ---
+    
+    @loader.command(
+        ru_doc="Показывает мини-гайд по настройке и использованию модуля.",
+        en_doc="Shows a mini-guide on how to set up and use the module."
+    )
+    async def ghinfocmd(self, message: Message):
+        """Показывает мини-гайд по модулю GitHubManager."""
+        await utils.answer(message, self.strings("info_guide"))
+        
+
+    @loader.command(
+        ru_doc="Выводит список ваших репозиториев в виде Inline-кнопок для интерактивного выбора.",
+        en_doc="Shows a list of your repositories as Inline buttons for interactive selection."
+    )
+    async def ghreposcmd(self, message: Message):
+        """Выводит список репозиториев пользователя."""
+        if not self.config["github_token"]:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        await self._ensure_session()
+
+        if not self.session:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        status_message = await utils.answer(message, "⏳ Получаю список репозиториев...")
+        
+        url = "https://api.github.com/user/repos?type=all&per_page=50"
+        
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    repos_data = await response.json()
+                else:
+                    error_json = await response.json()
+                    error_message = error_json.get("message", "Неизвестная ошибка")
+                    await utils.answer(status_message, self.strings("api_error").format(
+                        status=response.status,
+                        error=utils.escape_html(error_message)
+                    ))
+                    return
+        except Exception as e:
+            await utils.answer(status_message, self.strings("internal_error").format(f"Запрос API: {e}"))
+            logger.exception(e)
+            return
+
+        if not repos_data:
+            await utils.answer(status_message, self.strings("no_repos"))
+            return
+            
+        buttons = []
+        for repo in repos_data:
+            owner = repo.get("owner", {}).get("login")
+            repo_name = repo.get("name")
+            full_name = f"{owner}/{repo_name}"
+            
+            buttons.append([
+                {
+                    "text": full_name,
+                    "data": f"ghm_set_{owner}|{repo_name}",
+                }
+            ])
+
+        buttons.append([
+            {"text": "❌ Закрыть", "data": "ghm_close"}
+        ])
+
+        await utils.answer(status_message, self.strings("repo_list_header"), reply_markup=buttons)
+
+
+    @loader.command(
+        ru_doc="[сообщение коммита] - Загружает файл из ответа. Использует оригинальное имя файла. Сообщение коммита опционально.",
+        en_doc="[commit message] - Uploads file from reply. Uses original file name. Commit message is optional."
+    )
+    async def ghuploadcmd(self, message: Message):
+        """Загрузка нового файла в GitHub repository."""
+        
+        commit_message = utils.get_args_raw(message).strip()
+        
+        reply = await message.get_reply_message()
+        if not reply or not reply.media:
+            await utils.answer(message, self.strings("no_reply"))
+            return
+        
+        file_path = self._get_file_name(reply)
+
+        if not file_path:
+            await utils.answer(message, self.strings("no_filename"))
+            return
+
+        if not commit_message:
+            commit_message = f"File upload: {utils.escape_html(file_path)}"
+        
+        await self._process_upload(message, reply, file_path, commit_message, is_update=False)
+
+
+    @loader.command(
+        ru_doc="<путь_к_файлу> [сообщение коммита] - Обновляет файл в репозитории по указанному пути, используя файл из ответа. Если путь не указан, открывает интерактивный выбор файла. Если команда вызвана реплаем, использует путь из режима ожидания.",
+        en_doc="<file_path> [commit message] - Updates a file at the specified path, using the file from the reply. If no path is specified, opens an interactive file selector. If called as a reply, uses the path from the waiting mode."
+    )
+    async def ghupdatecmd(self, message: Message):
+        """Интерактивное или прямое обновление существующего файла в GitHub repository."""
+
+        user_id = message.sender_id
+        args = utils.get_args(message)
+        reply = await message.get_reply_message()
+
+        if not self.config["github_token"]:
+            await utils.answer(message, self.strings("no_config"))
+            return
+        
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+
+        if not owner or not repo:
+            await utils.answer(message, self.strings("no_repo_set"))
+            return
+        
+        # --- ЛОГИКА РЕЖИМА ОЖИДАНИЯ (интерактивный режим) ---
+        if reply and reply.media and user_id in self.temp_update_path:
+            # 1. Мы в режиме ожидания (пользователь выбрал файл, и теперь отвечает новым файлом)
+            repo_path = self.temp_update_path[user_id]
+            
+            commit_message = utils.get_args_raw(message).strip()
+            
+            # Сообщение коммита по умолчанию
+            if not commit_message:
+                commit_message = f"File update: {utils.escape_html(repo_path)}"
+
+            try:
+                # Выполняем обновление
+                await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
+            finally:
+                # ГАРАНТИРОВАННЫЙ СБРОС СЕССИИ
+                if user_id in self.temp_update_path:
+                    del self.temp_update_path[user_id]
+            return
+            
+        # --- ЛОГИКА ПРЯМОГО ВЫЗОВА / ИНТЕРАКТИВНОГО ЗАПУСКА ---
+        
+        if args:
+            # 2. Прямое обновление: .ghupdate path/to/file commit message (как раньше)
+            repo_path = args[0]
+            commit_message = " ".join(args[1:])
+            
+            if not reply or not reply.media:
+                await utils.answer(message, self.strings("no_reply"))
+                return
+
+            if not commit_message:
+                default_name = self._get_file_name(reply) or "новый файл"
+                commit_message = f"File update: {utils.escape_html(repo_path)} (from {default_name})"
+
+            await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
+        
+        elif reply and reply.media:
+            # 3. Reply to a file without pre-selected path: open browser, remember the reply
+            self.temp_update_reply[user_id] = reply
+            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
+            
+        else:
+            # 4. Интерактивное обновление: .ghupdate (открываем браузер файлов)
+            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+            
+            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
+
+    @loader.command(
+        ru_doc="[путь] - Показывает файлы репозитория в виде копируемых строк. Лимит страниц задается в конфиге.",
+        en_doc="[path] - Shows repository files as copyable <code>...</code> lines. Page size is controlled by config."
+    )
+    async def ghfilescmd(self, message: Message):
+        """Показывает список файлов репозитория."""
+
+        if not self.config["github_token"]:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+
+        if not owner or not repo:
+            await utils.answer(message, self.strings("no_repo_set"))
+            return
+
+        path = utils.get_args_raw(message).strip()
+        status_message = await utils.answer(message, "⏳ Получаю список файлов...")
+        await self._send_repo_file_list(status_message, owner, repo, path, page=1)
+
+
+    @loader.command(
+        ru_doc="<путь> [коммит] или без аргументов — удалить файл из репозитория.",
+        en_doc="<path> [commit] or no args — delete a file from the repository."
+    )
+    async def ghdelcmd(self, message: Message):
+        """Удаление файла из GitHub репозитория."""
+        if not self.config["github_token"]:
+            return await utils.answer(message, self.strings("no_config"))
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+        if not owner or not repo:
+            return await utils.answer(message, self.strings("no_repo_set"))
+
+        args = utils.get_args(message)
+        if args:
+            path = args[0]
+            commit_message = " ".join(args[1:]) or f"Delete {path}"
+            await self._delete_file(message, owner, repo, path, commit_message)
+        else:
+            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="delete")
+
+    async def _delete_file(self, message, owner: str, repo: str, path: str, commit_message: str):
+        """Fetch SHA and delete the file via GitHub API."""
+        await self._ensure_session()
+        if not self.session:
+            return await utils.answer(message, self.strings("no_config"))
+
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=path.lstrip("/"))
+        status_message = await utils
