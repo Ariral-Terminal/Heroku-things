@@ -11,11 +11,12 @@ __version__ = (6, 3, 10)
 # meta developer: @sxozuo forked by @desertedowl
 # requires: aiohttp
 
+import contextlib
 import aiohttp
 import base64
 import logging
 import json
-import re 
+import re
 from typing import Optional, Any
 
 from .. import loader, utils
@@ -76,9 +77,9 @@ class GitHubManagerMod(loader.Module):
             "    - Размер страницы задается в конфиге <code>files_per_list</code>.\n\n"
             "<b>✨ Новая команда:</b> <code>ghrepos</code> для интерактивного выбора репозитория."
         ),
-        "update_start": "📂 **Выберите файл для обновления** в репозитории <code>{owner}/{repo}</code> по пути <code>{path}</code>:",
-        "update_path": "📂 **Содержимое:** <code>{path}</code>",
-        "update_prompt": "✅ **Файл выбран:** <code>{path}</code>\nТеперь ответьте на сообщение с **новым файлом** и введите сообщение коммита.",
+        "update_start": "📂 <b>Выберите файл для обновления</b> в репозитории <code>{owner}/{repo}</code> по пути <code>{path}</code>:",
+        "update_path": "📂 <b>Содержимое:</b> <code>{path}</code>",
+        "update_prompt": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь ответьте на сообщение с новым файлом и введите сообщение коммита.",
         "update_no_path": "❌ <b>Ошибка:</b> Не удалось получить список файлов для пути: <code>{path}</code>.",
         "update_back": "⬅️ Назад",
         "update_cancel": "❌ Отмена",
@@ -467,10 +468,10 @@ class GitHubManagerMod(loader.Module):
         repo = self.config["repo_name"]
 
         if data == "ghmd_close":
-            try:
-                await call.delete()
-            except Exception:
+            with contextlib.suppress(Exception):
                 await call.answer()
+            with contextlib.suppress(Exception):
+                await call.delete()
             return
 
         if data.startswith("ghmd_dir:"):
@@ -724,15 +725,14 @@ class GitHubManagerMod(loader.Module):
         data = call.data
         
         if data == "ghm_close":
-            # При закрытии интерактивного меню, очищаем потенциальный путь, если он есть
             user_id = self._get_user_id_from_call(call)
-            if user_id and user_id in self.temp_update_path:
-                del self.temp_update_path[user_id]
-                
-            try:
-                await call.delete()
-            except Exception:
+            if user_id:
+                self.temp_update_path.pop(user_id, None)
+                self.temp_update_reply.pop(user_id, None)
+            with contextlib.suppress(Exception):
                 await call.answer()
+            with contextlib.suppress(Exception):
+                await call.delete()
             return
             
         if data.startswith("ghm_set_"):
@@ -765,11 +765,10 @@ class GitHubManagerMod(loader.Module):
             if user_id:
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
-                
-            try:
-                await call.delete()
-            except Exception:
+            with contextlib.suppress(Exception):
                 await call.answer()
+            with contextlib.suppress(Exception):
+                await call.delete()
             return
             
         if data.startswith("ghmu_dir:"):
@@ -809,11 +808,10 @@ class GitHubManagerMod(loader.Module):
 
 
     async def _ghfl_close_cb(self, call):
-        try:
+        with contextlib.suppress(Exception):
             await call.answer()
+        with contextlib.suppress(Exception):
             await call.delete()
-        except Exception:
-            pass
 
     @loader.callback_handler(ru_doc="Обрабатывает пагинацию списка файлов репозитория.")
     async def ghfl_callback_handler(self, call: Message):
