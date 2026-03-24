@@ -83,7 +83,13 @@ class GitHubManagerMod(loader.Module):
         "update_back": "⬅️ Назад",
         "update_cancel": "❌ Отмена",
         "user_id_error": "❌ Внутренняя ошибка: Не удалось определить ID пользователя, нажавшего кнопку. Проверьте логи.",
-        "update_timeout": "❌ <b>Ошибка:</b> Режим обновления файла не активен. Сначала используйте <code>.ghupdatecmd</code> без аргументов и выберите файл."
+        "update_timeout": "❌ <b>Ошибка:</b> Режим обновления файла не активен. Сначала используйте <code>.ghupdatecmd</code> без аргументов и выберите файл.",
+        "delete_start": "🗑 <b>Выберите файл для удаления</b> в репозитории <code>{owner}/{repo}</code>\nПуть: <code>{path}</code>",
+        "delete_confirm": "⚠️ <b>Удалить файл?</b>\n<code>{path}</code>\nРепозиторий: <code>{owner}/{repo}</code>",
+        "delete_btn_confirm": "✅ Удалить",
+        "delete_btn_cancel": "❌ Отмена",
+        "success_delete": "🗑 <b>Файл удалён:</b> <code>{path}</code>",
+        "delete_not_found": "❌ <b>Файл не найден:</b> <code>{path}</code>",
     }
 
     def __init__(self):
@@ -118,9 +124,9 @@ class GitHubManagerMod(loader.Module):
         self._client = client
         self._db = db
         self.session: Optional[aiohttp.ClientSession] = None
-        # Хранилище для пути к файлу, который пользователь собирается обновить
-        # Ключ: ID пользователя, нажавшего кнопку
-        self.temp_update_path = {} 
+        self.temp_update_path = {}
+        # Pre-stored reply message when user calls .ghupdate as reply to a file
+        self.temp_update_reply: dict = {}
     async def on_unload(self):
         if self.session and not self.session.closed:
             await self.session.close()
@@ -361,8 +367,10 @@ class GitHubManagerMod(loader.Module):
             await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
         
         elif reply and reply.media:
-            # 3. Команда вызвана реплаем на медиафайл, но не в режиме ожидания и без аргументов
-            await utils.answer(message, self.strings("update_timeout"))
+            # 3. Reply to a file without pre-selected path: open browser, remember the reply
+            self.temp_update_reply[user_id] = reply
+            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
             
         else:
             # 4. Интерактивное обновление: .ghupdate (открываем браузер файлов)
@@ -393,10 +401,106 @@ class GitHubManagerMod(loader.Module):
         await self._send_repo_file_list(status_message, owner, repo, path, page=1)
 
 
+    @loader.command(
+        ru_doc="<путь> [коммит] или без аргументов — удалить файл из репозитория.",
+        en_doc="<path> [commit] or no args — delete a file from the repository."
+    )
+    async def ghdelcmd(self, message: Message):
+        """Удаление файла из GitHub репозитория."""
+        if not self.config["github_token"]:
+            return await utils.answer(message, self.strings("no_config"))
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+        if not owner or not repo:
+            return await utils.answer(message, self.strings("no_repo_set"))
+
+        args = utils.get_args(message)
+        if args:
+            path = args[0]
+            commit_message = " ".join(args[1:]) or f"Delete {path}"
+            await self._delete_file(message, owner, repo, path, commit_message)
+        else:
+            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="delete")
+
+    async def _delete_file(self, message, owner: str, repo: str, path: str, commit_message: str):
+        """Fetch SHA and delete the file via GitHub API."""
+        await self._ensure_session()
+        if not self.session:
+            return await utils.answer(message, self.strings("no_config"))
+
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=path.lstrip("/"))
+        status_message = await utils.answer(message, f"⏳ Удаляю <code>{utils.escape_html(path)}</code>...")
+        try:
+            async with self.session.get(url) as resp:
+                if resp.status == 404:
+                    return await utils.answer(status_message, self.strings("delete_not_found").format(path=utils.escape_html(path)))
+                if resp.status != 200:
+                    body = await resp.json()
+                    return await utils.answer(status_message, self.strings("api_error").format(
+                        status=resp.status, error=utils.escape_html(body.get("message", ""))
+                    ))
+                sha = (await resp.json()).get("sha")
+
+            async with self.session.delete(url, json={"message": commit_message, "sha": sha}) as resp:
+                if resp.status == 200:
+                    await utils.answer(status_message, self.strings("success_delete").format(path=utils.escape_html(path)))
+                else:
+                    body = await resp.json()
+                    await utils.answer(status_message, self.strings("api_error").format(
+                        status=resp.status, error=utils.escape_html(body.get("message", ""))
+                    ))
+        except aiohttp.ClientResponseError as e:
+            await utils.answer(status_message, self.strings("api_error").format(
+                status=e.status, error=utils.escape_html(e.message)
+            ))
+            logger.exception(e)
+        except Exception as e:
+            await utils.answer(status_message, self.strings("internal_error").format(str(e)))
+            logger.exception(e)
+
+    @loader.callback_handler(ru_doc="Обрабатывает навигацию и выбор файла для удаления.")
+    async def ghmd_callback_handler(self, call):
+        """Обрабатывает колбэки браузера файлов в режиме удаления."""
+        data = call.data
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+
+        if data == "ghmd_close":
+            try:
+                await call.delete()
+            except Exception:
+                await call.answer()
+            return
+
+        if data.startswith("ghmd_dir:"):
+            path = data[len("ghmd_dir:"):]
+            await self._send_file_list(call, owner, repo, path, original_message=call, mode="delete")
+
+        elif data.startswith("ghmd_file:"):
+            path = data[len("ghmd_file:"):]
+            await call.edit(
+                self.strings("delete_confirm").format(
+                    path=utils.escape_html(path),
+                    owner=utils.escape_html(owner),
+                    repo=utils.escape_html(repo),
+                ),
+                reply_markup=[[
+                    {"text": self.strings("delete_btn_confirm"), "data": f"ghmd_do:{path}"},
+                    {"text": self.strings("delete_btn_cancel"), "data": "ghmd_close"},
+                ]],
+            )
+
+        elif data.startswith("ghmd_do:"):
+            path = data[len("ghmd_do:"):]
+            commit_message = f"Delete {path}"
+            await call.edit(f"⏳ Удаляю <code>{utils.escape_html(path)}</code>...")
+            await self._delete_file(call, owner, repo, path, commit_message)
+
     async def _send_file_list(self, message: Message, owner: str, repo: str, path: str, original_message: Message, mode: str = "update"):
         """Получает и отображает список файлов/папок для указанного пути."""
         url = GITHUB_API_URL.format(owner=owner, repo=repo, path=path.lstrip('/'))
-        prefix = "ghmu"
+        prefix = "ghmd" if mode == "delete" else "ghmu"
         
         await self._ensure_session()
         
@@ -453,11 +557,20 @@ class GitHubManagerMod(loader.Module):
                 "data": f"{prefix}_close"
             }])
             
-            text_header = self.strings("update_start").format(
-                owner=utils.escape_html(owner),
-                repo=utils.escape_html(repo),
-                path=utils.escape_html(path or "/")
-            ) if not path else self.strings("update_path").format(path=utils.escape_html(path))
+            if mode == "delete":
+                text_header = self.strings("delete_start").format(
+                    owner=utils.escape_html(owner),
+                    repo=utils.escape_html(repo),
+                    path=utils.escape_html(path or "/"),
+                )
+            elif not path:
+                text_header = self.strings("update_start").format(
+                    owner=utils.escape_html(owner),
+                    repo=utils.escape_html(repo),
+                    path=utils.escape_html(path or "/"),
+                )
+            else:
+                text_header = self.strings("update_path").format(path=utils.escape_html(path))
 
             await utils.answer(message, text_header, reply_markup=buttons)
 
@@ -648,10 +761,10 @@ class GitHubManagerMod(loader.Module):
         data = call.data
         
         if data == "ghmu_close":
-            # При закрытии интерактивного меню, очищаем потенциальный путь, если он есть
             user_id = self._get_user_id_from_call(call)
-            if user_id and user_id in self.temp_update_path:
-                del self.temp_update_path[user_id]
+            if user_id:
+                self.temp_update_path.pop(user_id, None)
+                self.temp_update_reply.pop(user_id, None)
                 
             try:
                 await call.delete()
@@ -668,27 +781,31 @@ class GitHubManagerMod(loader.Module):
             await self._send_file_list(call, owner, repo, path, original_message=call)
             
         elif data.startswith("ghmu_file:"):
-            # Выбран файл для обновления
-            
             user_id = self._get_user_id_from_call(call)
-            
             if user_id is None:
-                # Логируем и отвечаем пользователю, если даже аварийный механизм не сработал
-                logger.error(f"Критическая ошибка в ghm_callback_handler: не найден ID пользователя ни одним из способов. Vars(call): {vars(call)}")
+                logger.error("ghmu_file: could not determine user_id. vars(call): %s", vars(call))
                 await call.answer(self.strings("user_id_error"), show_alert=True)
                 return
 
             path = data[len("ghmu_file:"):]
-            self.temp_update_path[user_id] = path
-            
-            await call.edit(
-                self.strings("update_prompt").format(path=utils.escape_html(path)),
-                reply_markup=[[{
-                    "text": self.strings("update_cancel"),
-                    "data": "ghmu_close"
-                }]]
-            )
-            await call.answer(f"Выбран файл: {path}. Теперь ответьте на это сообщение новым файлом и командой .ghupdatecmd [коммит].", show_alert=True)
+            pre_reply = self.temp_update_reply.pop(user_id, None)
+
+            if pre_reply:
+                # User called .ghupdate as reply to a file → upload immediately
+                commit_message = f"File update: {path}"
+                await call.edit(f"⏳ Загружаю <code>{utils.escape_html(path)}</code>...")
+                await self._process_upload(call, pre_reply, path, commit_message, is_update=True)
+            else:
+                # Normal flow: ask user to reply with the new file
+                self.temp_update_path[user_id] = path
+                await call.edit(
+                    self.strings("update_prompt").format(path=utils.escape_html(path)),
+                    reply_markup=[[{"text": self.strings("update_cancel"), "data": "ghmu_close"}]],
+                )
+                await call.answer(
+                    f"Выбран: {path}. Ответьте на это сообщение новым файлом и командой .ghupdate [коммит].",
+                    show_alert=True,
+                )
 
 
     async def _ghfl_close_cb(self, call):
