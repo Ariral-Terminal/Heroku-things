@@ -86,6 +86,9 @@ class GitHubManagerMod(loader.Module):
         "update_prompt": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь ответьте на сообщение с новым файлом и введите сообщение коммита.",
         "update_prompt_saved_reply": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь отправьте <code>.ghupdate [коммит]</code>, чтобы обновить его уже сохраненным файлом.",
         "update_no_path": "❌ <b>Ошибка:</b> Не удалось получить список файлов для пути: <code>{path}</code>.",
+        "update_auto_found": "✅ <b>Найден файл в репозитории:</b> <code>{path}</code>\nЗапускаю автоматическое обновление.",
+        "update_auto_not_found": "ℹ️ <b>Файл <code>{filename}</code> не найден в репозитории.</b>\nОткрываю выбор файла вручную.",
+        "update_auto_ambiguous": "⚠️ <b>Найдено несколько совпадений для <code>{filename}</code>:</b> <code>{count}</code>\nОткрываю выбор файла вручную.",
         "update_back": "⬅️ Назад",
         "update_cancel": "❌ Отмена",
         "user_id_error": "❌ Внутренняя ошибка: Не удалось определить ID пользователя, нажавшего кнопку. Проверьте логи.",
@@ -395,9 +398,39 @@ class GitHubManagerMod(loader.Module):
                 self.temp_update_reply.pop(user_id, None)
         
         elif reply and reply.media:
-            # 3. Reply to a file without pre-selected path: open browser, remember the reply
+            # 3. Reply to a file: try to auto-detect the repository path by file name first.
+            reply_file_name = self._get_file_name(reply)
+            if reply_file_name:
+                matches = await self._find_repo_matches_for_file(owner, repo, reply_file_name)
+                if len(matches) == 1:
+                    repo_path = matches[0]
+                    commit_message = f"File update: {utils.escape_html(repo_path)}"
+                    status_message = await utils.answer(
+                        message,
+                        self.strings("update_auto_found").format(path=utils.escape_html(repo_path)),
+                    )
+                    await self._process_upload(status_message, reply, repo_path, commit_message, is_update=True)
+                    return
+
+                if len(matches) > 1:
+                    status_message = await utils.answer(
+                        message,
+                        self.strings("update_auto_ambiguous").format(
+                            filename=utils.escape_html(reply_file_name),
+                            count=len(matches),
+                        ),
+                    )
+                else:
+                    status_message = await utils.answer(
+                        message,
+                        self.strings("update_auto_not_found").format(
+                            filename=utils.escape_html(reply_file_name),
+                        ),
+                    )
+            else:
+                status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+
             self.temp_update_reply[user_id] = reply
-            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
             await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
             
         else:
@@ -664,6 +697,29 @@ class GitHubManagerMod(loader.Module):
 
         collected_files.sort(key=str.lower)
         return collected_files
+
+    async def _find_repo_matches_for_file(self, owner: str, repo: str, file_name: str) -> list[str]:
+        """Ищет пути в репозитории, совпадающие с именем файла из реплая."""
+
+        normalized_name = self._normalize_repo_path(file_name)
+        if not normalized_name:
+            return []
+
+        collected_files = await self._collect_repo_files(owner, repo, "")
+        if not collected_files:
+            return []
+
+        normalized_lower = normalized_name.lower()
+        exact_matches = [path for path in collected_files if path.lower() == normalized_lower]
+        if exact_matches:
+            return exact_matches
+
+        basename = normalized_lower.rsplit("/", 1)[-1]
+        return [
+            path
+            for path in collected_files
+            if path.rsplit("/", 1)[-1].lower() == basename
+        ]
 
     async def _send_repo_file_list(self, message: Message, owner: str, repo: str, path: str, page: int = 1):
         """Показывает список файлов в репозитории с пагинацией."""
