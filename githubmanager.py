@@ -6,7 +6,7 @@
     
 """
 
-__version__ = (6, 3, 10) 
+__version__ = (6, 3, 11)
 
 # meta developer: @sxozuo forked by @desertedowl
 # requires: aiohttp
@@ -14,8 +14,10 @@ __version__ = (6, 3, 10)
 import contextlib
 import aiohttp
 import base64
+import io
 import logging
 import json
+import mimetypes
 import re
 from typing import Optional, Any
 
@@ -75,11 +77,14 @@ class GitHubManagerMod(loader.Module):
             "<b>Действие:</b> Показывает список файлов в репозитории в виде копируемых <code>...</code> строк.\n"
             "    - <b>[путь]</b> — опционально. Можно указать папку или файл.\n"
             "    - Размер страницы задается в конфиге <code>files_per_list</code>.\n\n"
-            "<b>✨ Новая команда:</b> <code>ghrepos</code> для интерактивного выбора репозитория."
+            "Команда: <code>ghget</code> &lt;путь&gt;\n"
+            "<b>Действие:</b> Отправляет файл из репозитория документом вместе с подробной информацией о нем.\n\n"
+            "<b>✨ Дополнительно:</b> <code>ghrepos</code> для интерактивного выбора репозитория."
         ),
         "update_start": "📂 <b>Выберите файл для обновления</b> в репозитории <code>{owner}/{repo}</code> по пути <code>{path}</code>:",
         "update_path": "📂 <b>Содержимое:</b> <code>{path}</code>",
         "update_prompt": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь ответьте на сообщение с новым файлом и введите сообщение коммита.",
+        "update_prompt_saved_reply": "✅ <b>Файл выбран:</b> <code>{path}</code>\nТеперь отправьте <code>.ghupdate [коммит]</code>, чтобы обновить его уже сохраненным файлом.",
         "update_no_path": "❌ <b>Ошибка:</b> Не удалось получить список файлов для пути: <code>{path}</code>.",
         "update_back": "⬅️ Назад",
         "update_cancel": "❌ Отмена",
@@ -91,6 +96,10 @@ class GitHubManagerMod(loader.Module):
         "delete_btn_cancel": "❌ Отмена",
         "success_delete": "🗑 <b>Файл удалён:</b> <code>{path}</code>",
         "delete_not_found": "❌ <b>Файл не найден:</b> <code>{path}</code>",
+        "get_no_path": "❌ <b>Ошибка:</b> Укажите путь к файлу в репозитории.",
+        "get_fetching": "⏳ Получаю файл <code>{path}</code> из репозитория <code>{owner}/{repo}</code>...",
+        "get_not_file": "❌ <b>Ошибка:</b> Путь <code>{path}</code> не указывает на файл в репозитории.",
+        "get_send_failed": "❌ <b>Ошибка:</b> Не удалось отправить файл: {}",
     }
 
     def __init__(self):
@@ -318,6 +327,7 @@ class GitHubManagerMod(loader.Module):
         user_id = message.sender_id
         args = utils.get_args(message)
         reply = await message.get_reply_message()
+        stored_reply = self.temp_update_reply.get(user_id)
 
         if not self.config["github_token"]:
             await utils.answer(message, self.strings("no_config"))
@@ -346,8 +356,22 @@ class GitHubManagerMod(loader.Module):
                 await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
             finally:
                 # ГАРАНТИРОВАННЫЙ СБРОС СЕССИИ
-                if user_id in self.temp_update_path:
-                    del self.temp_update_path[user_id]
+                self.temp_update_path.pop(user_id, None)
+                self.temp_update_reply.pop(user_id, None)
+            return
+
+        if not reply and stored_reply and user_id in self.temp_update_path:
+            repo_path = self.temp_update_path[user_id]
+            commit_message = utils.get_args_raw(message).strip()
+
+            if not commit_message:
+                commit_message = f"File update: {utils.escape_html(repo_path)}"
+
+            try:
+                await self._process_upload(message, stored_reply, repo_path, commit_message, is_update=True)
+            finally:
+                self.temp_update_path.pop(user_id, None)
+                self.temp_update_reply.pop(user_id, None)
             return
             
         # --- ЛОГИКА ПРЯМОГО ВЫЗОВА / ИНТЕРАКТИВНОГО ЗАПУСКА ---
@@ -365,7 +389,10 @@ class GitHubManagerMod(loader.Module):
                 default_name = self._get_file_name(reply) or "новый файл"
                 commit_message = f"File update: {utils.escape_html(repo_path)} (from {default_name})"
 
-            await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
+            try:
+                await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
+            finally:
+                self.temp_update_reply.pop(user_id, None)
         
         elif reply and reply.media:
             # 3. Reply to a file without pre-selected path: open browser, remember the reply
@@ -401,15 +428,43 @@ class GitHubManagerMod(loader.Module):
         status_message = await utils.answer(message, "⏳ Получаю список файлов...")
         await self._send_repo_file_list(status_message, owner, repo, path, page=1)
 
+    @loader.command(
+        ru_doc="<путь> - Получает файл из репозитория, отправляет его документом и показывает подробную информацию.",
+        en_doc="<path> - Fetches a repository file, sends it as a document, and shows detailed information."
+    )
+    async def ghgetcmd(self, message: Message):
+        """Отправляет файл из репозитория вместе с подробной информацией."""
+        if not self.config["github_token"]:
+            return await utils.answer(message, self.strings("no_config"))
+
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+        if not owner or not repo:
+            return await utils.answer(message, self.strings("no_repo_set"))
+
+        path = self._normalize_repo_path(utils.get_args_raw(message))
+        if not path:
+            return await utils.answer(message, self.strings("get_no_path"))
+
+        status_message = await utils.answer(
+            message,
+            self.strings("get_fetching").format(
+                owner=utils.escape_html(owner),
+                repo=utils.escape_html(repo),
+                path=utils.escape_html(path),
+            ),
+        )
+        await self._send_repo_file(status_message, owner, repo, path)
 
     @loader.command(
         ru_doc="<путь> [коммит] или без аргументов — удалить файл из репозитория.",
-        en_doc="<path> [commit] or no args — delete a file from the repository."
+        en_doc="<path> [commit] or no args - delete a file from the repository."
     )
     async def ghdelcmd(self, message: Message):
         """Удаление файла из GitHub репозитория."""
         if not self.config["github_token"]:
             return await utils.answer(message, self.strings("no_config"))
+
         owner = self.config["repo_owner"]
         repo = self.config["repo_name"]
         if not owner or not repo:
@@ -420,158 +475,128 @@ class GitHubManagerMod(loader.Module):
             path = args[0]
             commit_message = " ".join(args[1:]) or f"Delete {path}"
             await self._delete_file(message, owner, repo, path, commit_message)
-        else:
-            status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
-            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="delete")
-
-    async def _delete_file(self, message, owner: str, repo: str, path: str, commit_message: str):
-        """Fetch SHA and delete the file via GitHub API."""
-        await self._ensure_session()
-        if not self.session:
-            return await utils.answer(message, self.strings("no_config"))
-
-        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=path.lstrip("/"))
-        status_message = await utils.answer(message, f"⏳ Удаляю <code>{utils.escape_html(path)}</code>...")
-        try:
-            async with self.session.get(url) as resp:
-                if resp.status == 404:
-                    return await utils.answer(status_message, self.strings("delete_not_found").format(path=utils.escape_html(path)))
-                if resp.status != 200:
-                    body = await resp.json()
-                    return await utils.answer(status_message, self.strings("api_error").format(
-                        status=resp.status, error=utils.escape_html(body.get("message", ""))
-                    ))
-                sha = (await resp.json()).get("sha")
-
-            async with self.session.delete(url, json={"message": commit_message, "sha": sha}) as resp:
-                if resp.status == 200:
-                    await utils.answer(status_message, self.strings("success_delete").format(path=utils.escape_html(path)))
-                else:
-                    body = await resp.json()
-                    await utils.answer(status_message, self.strings("api_error").format(
-                        status=resp.status, error=utils.escape_html(body.get("message", ""))
-                    ))
-        except aiohttp.ClientResponseError as e:
-            await utils.answer(status_message, self.strings("api_error").format(
-                status=e.status, error=utils.escape_html(e.message)
-            ))
-            logger.exception(e)
-        except Exception as e:
-            await utils.answer(status_message, self.strings("internal_error").format(str(e)))
-            logger.exception(e)
-
-    @loader.callback_handler(ru_doc="Обрабатывает навигацию и выбор файла для удаления.")
-    async def ghmd_callback_handler(self, call):
-        """Обрабатывает колбэки браузера файлов в режиме удаления."""
-        data = call.data
-        owner = self.config["repo_owner"]
-        repo = self.config["repo_name"]
-
-        if data == "ghmd_close":
-            with contextlib.suppress(Exception):
-                await call.answer()
-            with contextlib.suppress(Exception):
-                await call.delete()
             return
 
-        if data.startswith("ghmd_dir:"):
-            path = data[len("ghmd_dir:"):]
-            await self._send_file_list(call, owner, repo, path, original_message=call, mode="delete")
+        status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
+        await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="delete")
 
-        elif data.startswith("ghmd_file:"):
-            path = data[len("ghmd_file:"):]
-            await call.edit(
-                self.strings("delete_confirm").format(
-                    path=utils.escape_html(path),
-                    owner=utils.escape_html(owner),
-                    repo=utils.escape_html(repo),
-                ),
-                reply_markup=[[
-                    {"text": self.strings("delete_btn_confirm"), "data": f"ghmd_do:{path}"},
-                    {"text": self.strings("delete_btn_cancel"), "data": "ghmd_close"},
-                ]],
-            )
+    def _normalize_repo_path(self, path: str) -> str:
+        """Нормализует путь для GitHub API."""
 
-        elif data.startswith("ghmd_do:"):
-            path = data[len("ghmd_do:"):]
-            commit_message = f"Delete {path}"
-            await call.edit(f"⏳ Удаляю <code>{utils.escape_html(path)}</code>...")
-            await self._delete_file(call, owner, repo, path, commit_message)
+        processed_path = WINDOWS_DRIVE_PREFIX_REGEX.sub("", path.strip())
+        return processed_path.lstrip("/")
+
+    async def _read_github_error(self, response: aiohttp.ClientResponse) -> str:
+        """Безопасно достает сообщение об ошибке из ответа GitHub API."""
+
+        with contextlib.suppress(Exception):
+            error_json = await response.json()
+            if isinstance(error_json, dict):
+                message = error_json.get("message")
+                if message:
+                    return str(message)
+                if error_json:
+                    return json.dumps(error_json, ensure_ascii=False)
+
+        with contextlib.suppress(Exception):
+            text = await response.text()
+            if text:
+                return text
+
+        return "Неизвестная ошибка"
+
+    def _get_browser_mode_config(self, mode: str) -> tuple[str, str]:
+        """Возвращает префикс callback-данных и заголовок для браузера файлов."""
+
+        if mode == "delete":
+            return "ghmd", "delete"
+        return "ghmu", "update"
 
     async def _send_file_list(self, message: Message, owner: str, repo: str, path: str, original_message: Message, mode: str = "update"):
         """Получает и отображает список файлов/папок для указанного пути."""
-        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=path.lstrip('/'))
-        prefix = "ghmd" if mode == "delete" else "ghmu"
-        
+
+        del original_message
+
         await self._ensure_session()
-        
+        if not self.session:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        normalized_path = self._normalize_repo_path(path)
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=normalized_path)
+        prefix, header_mode = self._get_browser_mode_config(mode)
+
         try:
             async with self.session.get(url) as response:
                 if response.status == 200:
                     contents = await response.json()
                 elif response.status == 404:
-                    await utils.answer(message, self.strings("update_no_path").format(path=utils.escape_html(path)))
+                    await utils.answer(message, self.strings("update_no_path").format(path=utils.escape_html(normalized_path or "/")))
                     return
                 else:
-                    error_json = await response.json()
-                    error_message = error_json.get("message", "Неизвестная ошибка")
+                    error_message = await self._read_github_error(response)
                     await utils.answer(message, self.strings("api_error").format(
-                        status=response.status, error=utils.escape_html(error_message)
+                        status=response.status,
+                        error=utils.escape_html(error_message),
                     ))
                     return
+
+            if isinstance(contents, dict):
+                contents = [contents]
 
             buttons = []
             files = []
             dirs = []
 
             for item in contents:
-                name = item['name']
-                item_path = item['path']
-                if item['type'] == 'dir':
+                item_type = item.get("type")
+                name = item.get("name")
+                item_path = item.get("path")
+                if not name or not item_path:
+                    continue
+                if item_type == "dir":
                     dirs.append((name, item_path))
-                elif item['type'] == 'file':
+                elif item_type == "file":
                     files.append((name, item_path))
 
-            # Сортируем и добавляем кнопки (сначала папки, потом файлы)
             for name, item_path in sorted(dirs, key=lambda x: x[0].lower()):
                 buttons.append([{
-                    "text": f"📁 {name}", 
-                    "data": f"{prefix}_dir:{item_path}"
+                    "text": f"📁 {name}",
+                    "data": f"{prefix}_dir:{item_path}",
                 }])
 
             for name, item_path in sorted(files, key=lambda x: x[0].lower()):
                 buttons.append([{
-                    "text": f"📄 {name}", 
-                    "data": f"{prefix}_file:{item_path}"
+                    "text": f"📄 {name}",
+                    "data": f"{prefix}_file:{item_path}",
                 }])
 
-            # Кнопка "Назад"
-            if path:
-                parent_path = "/".join(path.split("/")[:-1])
+            if normalized_path:
+                parent_path = "/".join(normalized_path.split("/")[:-1])
                 buttons.append([{
                     "text": self.strings("update_back"),
-                    "data": f"{prefix}_dir:{parent_path}"
+                    "data": f"{prefix}_dir:{parent_path}",
                 }])
 
             buttons.append([{
                 "text": self.strings("update_cancel"),
-                "data": f"{prefix}_close"
+                "data": f"{prefix}_close",
             }])
-            
-            if mode == "delete":
+
+            if header_mode == "delete":
                 text_header = self.strings("delete_start").format(
                     owner=utils.escape_html(owner),
                     repo=utils.escape_html(repo),
-                    path=utils.escape_html(path or "/"),
+                    path=utils.escape_html(normalized_path or "/"),
                 )
-            elif not path:
+            else:
                 text_header = self.strings("update_start").format(
                     owner=utils.escape_html(owner),
                     repo=utils.escape_html(repo),
-                    path=utils.escape_html(path or "/"),
+                    path=utils.escape_html(normalized_path or "/"),
+                ) if not normalized_path else self.strings("update_path").format(
+                    path=utils.escape_html(normalized_path)
                 )
-            else:
-                text_header = self.strings("update_path").format(path=utils.escape_html(path))
 
             await utils.answer(message, text_header, reply_markup=buttons)
 
@@ -589,15 +614,14 @@ class GitHubManagerMod(loader.Module):
             return 25
         return value if value > 0 else 0
 
-    async def _collect_repo_files(self, owner: str, repo: str, path: str) -> list[str]:
+    async def _collect_repo_files(self, owner: str, repo: str, path: str) -> Optional[list[str]]:
         """Рекурсивно собирает все файлы из репозитория или подпути."""
 
         await self._ensure_session()
-
         if not self.session:
             return []
 
-        normalized_path = path.strip("/")
+        normalized_path = self._normalize_repo_path(path)
         collected_files = []
         queue = [normalized_path]
         visited_dirs = set()
@@ -616,13 +640,12 @@ class GitHubManagerMod(loader.Module):
                 elif response.status == 404:
                     return None
                 else:
-                    error_json = await response.json()
-                    error_message = error_json.get("message", "Неизвестная ошибка")
+                    error_message = await self._read_github_error(response)
                     raise aiohttp.ClientResponseError(
                         response.request_info,
                         response.history,
                         status=response.status,
-                        message=error_message
+                        message=error_message,
                     )
 
             if isinstance(payload, dict):
@@ -646,7 +669,6 @@ class GitHubManagerMod(loader.Module):
         """Показывает список файлов в репозитории с пагинацией."""
 
         await self._ensure_session()
-
         if not self.session:
             await utils.answer(message, self.strings("no_config"))
             return
@@ -657,12 +679,12 @@ class GitHubManagerMod(loader.Module):
             return
 
         try:
-            normalized_path = path.strip("/")
-            collected_files = await self._collect_repo_files(owner, repo, path)
+            normalized_path = self._normalize_repo_path(path)
+            collected_files = await self._collect_repo_files(owner, repo, normalized_path)
             if collected_files is None:
                 await utils.answer(
                     message,
-                    self.strings("files_list_path_error").format(path=utils.escape_html(path or "/"))
+                    self.strings("files_list_path_error").format(path=utils.escape_html(normalized_path or "/")),
                 )
                 return
 
@@ -702,123 +724,181 @@ class GitHubManagerMod(loader.Module):
             if page > 1:
                 nav_buttons.append({
                     "text": self.strings("files_list_prev"),
-                    "data": f"ghfl_page:{page - 1}|{path}"
+                    "data": f"ghfl_page:{page - 1}|{normalized_path}",
                 })
             if page < total_pages:
                 nav_buttons.append({
                     "text": self.strings("files_list_next"),
-                    "data": f"ghfl_page:{page + 1}|{path}"
+                    "data": f"ghfl_page:{page + 1}|{normalized_path}",
                 })
             if nav_buttons:
                 buttons.append(nav_buttons)
             buttons.append([{"text": self.strings("files_list_close"), "callback": self._ghfl_close_cb}])
+
             await utils.answer(message, "\n".join(lines), reply_markup=buttons)
 
         except Exception as e:
             await utils.answer(message, self.strings("internal_error").format(str(e)))
             logger.exception(e)
-            
-            
+
     @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок списка репозиториев.")
     async def ghm_callback_handler(self, call: Message):
         """Обрабатывает колбэки от Inline-кнопок, созданных командой ghreposcmd."""
+
         data = call.data
-        
+
         if data == "ghm_close":
             user_id = self._get_user_id_from_call(call)
             if user_id:
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
-            with contextlib.suppress(Exception):
-                await call.answer()
-            with contextlib.suppress(Exception):
+
+            try:
                 await call.delete()
+            except Exception:
+                await call.answer()
             return
-            
-        if data.startswith("ghm_set_"):
-            parts = data[8:].split("|") 
-            if len(parts) != 2:
-                await call.answer("Ошибка данных колбэка", show_alert=True)
-                return
 
-            owner, repo_name = parts
-            
-            self.config["repo_owner"] = owner
-            self.config["repo_name"] = repo_name
-            
-            await call.edit(
-                self.strings("repo_set_success").format(
-                    owner=utils.escape_html(owner), 
-                    repo=utils.escape_html(repo_name)
-                )
+        if not data.startswith("ghm_set_"):
+            return
+
+        parts = data[8:].split("|")
+        if len(parts) != 2:
+            await call.answer("Ошибка данных колбэка", show_alert=True)
+            return
+
+        owner, repo_name = parts
+        self.config["repo_owner"] = owner
+        self.config["repo_name"] = repo_name
+
+        await call.edit(
+            self.strings("repo_set_success").format(
+                owner=utils.escape_html(owner),
+                repo=utils.escape_html(repo_name),
             )
-            await call.answer(f"Репозиторий установлен: {owner}/{repo_name}", show_alert=True)
-
+        )
+        await call.answer(f"Репозиторий установлен: {owner}/{repo_name}", show_alert=True)
 
     @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок интерактивного обновления файла.")
     async def ghmu_callback_handler(self, call: Message):
         """Обрабатывает колбэки для навигации по файлам при обновлении."""
+
         data = call.data
-        
+
         if data == "ghmu_close":
             user_id = self._get_user_id_from_call(call)
             if user_id:
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
-            with contextlib.suppress(Exception):
-                await call.answer()
-            with contextlib.suppress(Exception):
+
+            try:
                 await call.delete()
+            except Exception:
+                await call.answer()
             return
-            
+
         if data.startswith("ghmu_dir:"):
-            # Навигация в папку
             owner = self.config["repo_owner"]
             repo = self.config["repo_name"]
             path = data[len("ghmu_dir:"):]
-            
-            await self._send_file_list(call, owner, repo, path, original_message=call)
-            
-        elif data.startswith("ghmu_file:"):
-            user_id = self._get_user_id_from_call(call)
-            if user_id is None:
-                logger.error("ghmu_file: could not determine user_id. vars(call): %s", vars(call))
-                await call.answer(self.strings("user_id_error"), show_alert=True)
-                return
+            await self._send_file_list(call, owner, repo, path, original_message=call, mode="update")
+            return
 
-            path = data[len("ghmu_file:"):]
-            pre_reply = self.temp_update_reply.pop(user_id, None)
+        if not data.startswith("ghmu_file:"):
+            return
 
-            if pre_reply:
-                # User called .ghupdate as reply to a file → upload immediately
-                commit_message = f"File update: {path}"
-                await call.edit(f"⏳ Загружаю <code>{utils.escape_html(path)}</code>...")
-                await self._process_upload(call, pre_reply, path, commit_message, is_update=True)
-            else:
-                # Normal flow: ask user to reply with the new file
-                self.temp_update_path[user_id] = path
-                await call.edit(
-                    self.strings("update_prompt").format(path=utils.escape_html(path)),
-                    reply_markup=[[{"text": self.strings("update_cancel"), "data": "ghmu_close"}]],
-                )
-                await call.answer(
-                    f"Выбран: {path}. Ответьте на это сообщение новым файлом и командой .ghupdate [коммит].",
-                    show_alert=True,
-                )
+        user_id = self._get_user_id_from_call(call)
+        if user_id is None:
+            logger.error(
+                "Критическая ошибка в ghmu_callback_handler: не найден ID пользователя. Vars(call): %s",
+                vars(call),
+            )
+            await call.answer(self.strings("user_id_error"), show_alert=True)
+            return
 
+        path = data[len("ghmu_file:"):]
+        self.temp_update_path[user_id] = path
+
+        prompt_key = "update_prompt_saved_reply" if user_id in self.temp_update_reply else "update_prompt"
+        await call.edit(
+            self.strings(prompt_key).format(path=utils.escape_html(path)),
+            reply_markup=[[{
+                "text": self.strings("update_cancel"),
+                "data": "ghmu_close",
+            }]]
+        )
+
+        alert_text = (
+            f"Выбран файл: {path}. Теперь отправьте .ghupdate [коммит] для обновления сохраненным файлом."
+            if user_id in self.temp_update_reply
+            else f"Выбран файл: {path}. Теперь ответьте на это сообщение новым файлом и командой .ghupdate [коммит]."
+        )
+        await call.answer(alert_text, show_alert=True)
+
+    @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок интерактивного удаления файла.")
+    async def ghmd_callback_handler(self, call: Message):
+        """Обрабатывает колбэки для удаления файлов."""
+
+        data = call.data
+
+        if data == "ghmd_close":
+            try:
+                await call.delete()
+            except Exception:
+                await call.answer()
+            return
+
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+
+        if data.startswith("ghmd_dir:"):
+            path = data[len("ghmd_dir:"):]
+            await self._send_file_list(call, owner, repo, path, original_message=call, mode="delete")
+            return
+
+        if data.startswith("ghmd_file:"):
+            path = data[len("ghmd_file:"):]
+            parent_path = "/".join(path.split("/")[:-1])
+            reply_markup = [[{
+                "text": self.strings("delete_btn_confirm"),
+                "data": f"ghmd_confirm:{path}",
+            }]]
+            if path:
+                reply_markup.append([{
+                    "text": self.strings("update_back"),
+                    "data": f"ghmd_dir:{parent_path}",
+                }])
+            reply_markup.append([{
+                "text": self.strings("delete_btn_cancel"),
+                "data": "ghmd_close",
+            }])
+
+            await call.edit(
+                self.strings("delete_confirm").format(
+                    path=utils.escape_html(path),
+                    owner=utils.escape_html(owner),
+                    repo=utils.escape_html(repo),
+                ),
+                reply_markup=reply_markup,
+            )
+            return
+
+        if data.startswith("ghmd_confirm:"):
+            path = data[len("ghmd_confirm:"):]
+            await self._delete_file(call, owner, repo, path, f"Delete {path}")
 
     async def _ghfl_close_cb(self, call):
-        with contextlib.suppress(Exception):
+        try:
             await call.answer()
-        with contextlib.suppress(Exception):
             await call.delete()
+        except Exception:
+            pass
 
     @loader.callback_handler(ru_doc="Обрабатывает пагинацию списка файлов репозитория.")
     async def ghfl_callback_handler(self, call: Message):
         """Обрабатывает кнопки пагинации для .ghfiles."""
 
         data = call.data
-
         if not data.startswith("ghfl_page:"):
             return
 
@@ -838,28 +918,246 @@ class GitHubManagerMod(loader.Module):
 
         await self._send_repo_file_list(call, owner, repo, path, page=page)
 
+    def _format_bytes(self, size: int) -> str:
+        """Возвращает человекочитаемый размер файла."""
+
+        units = ("B", "KB", "MB", "GB", "TB")
+        value = float(size)
+        for unit in units:
+            if value < 1024 or unit == units[-1]:
+                if unit == "B":
+                    return f"{int(value)} {unit}"
+                return f"{value:.2f} {unit}"
+            value /= 1024
+        return f"{int(size)} B"
+
+    def _truncate(self, value: str, limit: int = 140) -> str:
+        """Обрезает строку до безопасной длины для подписи."""
+
+        if len(value) <= limit:
+            return value
+        return value[: limit - 3] + "..."
+
+    def _build_file_info_caption(self, owner: str, repo: str, file_data: dict, last_commit: Optional[dict]) -> str:
+        """Формирует подпись с подробной информацией о файле."""
+
+        name = file_data.get("name") or "unknown"
+        path = file_data.get("path") or name
+        size = file_data.get("size")
+        if not isinstance(size, int):
+            size = 0
+
+        mime_type = mimetypes.guess_type(name)[0] or "application/octet-stream"
+        lines = [
+            "📄 <b>Файл из GitHub</b>",
+            f"Репозиторий: <code>{utils.escape_html(owner)}/{utils.escape_html(repo)}</code>",
+            f"Имя: <code>{utils.escape_html(name)}</code>",
+            f"Путь: <code>{utils.escape_html(path)}</code>",
+            f"Размер: <code>{self._format_bytes(size)}</code> (<code>{size}</code> B)",
+            f"MIME: <code>{utils.escape_html(mime_type)}</code>",
+        ]
+
+        sha = file_data.get("sha")
+        if sha:
+            lines.append(f"SHA: <code>{utils.escape_html(sha)}</code>")
+
+        html_url = file_data.get("html_url")
+        if html_url:
+            lines.append(f"GitHub: {utils.escape_html(html_url)}")
+
+        download_url = file_data.get("download_url")
+        if download_url:
+            lines.append(f"Download: {utils.escape_html(download_url)}")
+
+        if last_commit:
+            commit_sha = last_commit.get("sha")
+            author = last_commit.get("author")
+            date = last_commit.get("date")
+            message = last_commit.get("message")
+            if commit_sha:
+                lines.append(f"Последний коммит: <code>{utils.escape_html(commit_sha)}</code>")
+            if author:
+                lines.append(f"Автор: <code>{utils.escape_html(author)}</code>")
+            if date:
+                lines.append(f"Дата: <code>{utils.escape_html(date)}</code>")
+            if message:
+                lines.append(f"Сообщение: <code>{utils.escape_html(self._truncate(message))}</code>")
+
+        return "\n".join(lines)
+
+    async def _get_last_commit_for_path(self, owner: str, repo: str, path: str) -> Optional[dict]:
+        """Возвращает информацию о последнем коммите, затронувшем файл."""
+
+        await self._ensure_session()
+        if not self.session:
+            return None
+
+        url = f"https://api.github.com/repos/{owner}/{repo}/commits"
+        try:
+            async with self.session.get(url, params={"path": path, "per_page": 1}) as response:
+                if response.status != 200:
+                    return None
+                payload = await response.json()
+        except Exception:
+            return None
+
+        if not payload:
+            return None
+
+        commit = payload[0]
+        commit_info = commit.get("commit", {})
+        author_info = commit_info.get("author", {})
+        return {
+            "sha": (commit.get("sha") or "")[:7],
+            "author": author_info.get("name") or commit.get("author", {}).get("login"),
+            "date": author_info.get("date"),
+            "message": commit_info.get("message"),
+        }
+
+    async def _download_repo_file_bytes(self, url: str, file_data: dict) -> bytes:
+        """Скачивает байты файла через GitHub API."""
+
+        async with self.session.get(url, headers={"Accept": "application/vnd.github.raw"}) as response:
+            if response.status == 200:
+                return await response.read()
+
+        content = file_data.get("content")
+        if content and file_data.get("encoding") == "base64":
+            return base64.b64decode(content)
+
+        raise ValueError("GitHub API did not return file bytes")
+
+    async def _send_repo_file(self, message: Message, owner: str, repo: str, path: str):
+        """Получает файл из GitHub и отправляет его документом с подробной информацией."""
+
+        await self._ensure_session()
+        if not self.session:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        normalized_path = self._normalize_repo_path(path)
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=normalized_path)
+
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    file_data = await response.json()
+                elif response.status == 404:
+                    await utils.answer(message, self.strings("delete_not_found").format(path=utils.escape_html(normalized_path)))
+                    return
+                else:
+                    error_message = await self._read_github_error(response)
+                    await utils.answer(message, self.strings("api_error").format(
+                        status=response.status,
+                        error=utils.escape_html(error_message),
+                    ))
+                    return
+
+            if not isinstance(file_data, dict) or file_data.get("type") != "file":
+                await utils.answer(message, self.strings("get_not_file").format(path=utils.escape_html(normalized_path)))
+                return
+
+            file_bytes = await self._download_repo_file_bytes(url, file_data)
+            last_commit = await self._get_last_commit_for_path(owner, repo, normalized_path)
+
+            file_buffer = io.BytesIO(file_bytes)
+            file_buffer.name = file_data.get("name") or normalized_path.rsplit("/", 1)[-1] or "github_file"
+
+            await message.respond(
+                self._build_file_info_caption(owner, repo, file_data, last_commit),
+                file=file_buffer,
+                force_document=True,
+            )
+
+            with contextlib.suppress(Exception):
+                await message.delete()
+
+        except aiohttp.ClientResponseError as e:
+            await utils.answer(
+                message,
+                self.strings("api_error").format(
+                    status=e.status,
+                    error=utils.escape_html(e.message),
+                ),
+            )
+            logger.exception(e)
+        except Exception as e:
+            await utils.answer(message, self.strings("get_send_failed").format(utils.escape_html(str(e))))
+            logger.exception(e)
+
+    async def _delete_file(self, message: Message, owner: str, repo: str, path: str, commit_message: str):
+        """Удаляет файл через GitHub API."""
+
+        await self._ensure_session()
+        if not self.session:
+            await utils.answer(message, self.strings("no_config"))
+            return
+
+        normalized_path = self._normalize_repo_path(path)
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=normalized_path)
+        status_message = await utils.answer(
+            message,
+            f"⏳ Удаляю файл <code>{utils.escape_html(normalized_path)}</code> из репозитория <code>{utils.escape_html(owner)}/{utils.escape_html(repo)}</code>...",
+        )
+
+        try:
+            async with self.session.get(url) as response:
+                if response.status == 200:
+                    file_data = await response.json()
+                elif response.status == 404:
+                    await utils.answer(status_message, self.strings("delete_not_found").format(path=utils.escape_html(normalized_path)))
+                    return
+                else:
+                    error_message = await self._read_github_error(response)
+                    await utils.answer(status_message, self.strings("api_error").format(
+                        status=response.status,
+                        error=utils.escape_html(error_message),
+                    ))
+                    return
+
+            sha = file_data.get("sha")
+            if not sha:
+                await utils.answer(status_message, self.strings("get_not_file").format(path=utils.escape_html(normalized_path)))
+                return
+
+            async with self.session.delete(url, json={"message": commit_message, "sha": sha}) as response:
+                if response.status == 200:
+                    await utils.answer(status_message, self.strings("success_delete").format(path=utils.escape_html(normalized_path)))
+                    return
+                if response.status == 404:
+                    await utils.answer(status_message, self.strings("delete_not_found").format(path=utils.escape_html(normalized_path)))
+                    return
+
+                error_message = await self._read_github_error(response)
+                await utils.answer(status_message, self.strings("api_error").format(
+                    status=response.status,
+                    error=utils.escape_html(error_message),
+                ))
+
+        except Exception as e:
+            await utils.answer(status_message, self.strings("internal_error").format(str(e)))
+            logger.exception(e)
 
     def _get_file_name(self, reply: Message) -> Optional[str]:
         """Утилита для определения имени файла из сообщения-ответа."""
+
         media_entity = reply.document or reply.photo or reply.video or reply.audio
-        
         if not media_entity:
             return None
-            
-        file_path = getattr(media_entity, 'file_name', None)
-        
+
+        file_path = getattr(media_entity, "file_name", None)
         if not file_path:
-            file_path = getattr(media_entity, 'name', None)
-            
-        if not file_path and getattr(media_entity, 'attributes', None):
+            file_path = getattr(media_entity, "name", None)
+
+        if not file_path and getattr(media_entity, "attributes", None):
             for attr in media_entity.attributes:
-                if hasattr(attr, 'file_name'):
+                if hasattr(attr, "file_name"):
                     file_path = attr.file_name
                     break
-        
+
         if not file_path and reply.photo:
             file_path = f"photo_{media_entity.id}.jpg"
-            
+
         return file_path
 
     async def _process_upload(self, message: Message, reply: Message, file_path: str, commit_message: str, is_update: bool = False):
@@ -868,16 +1166,15 @@ class GitHubManagerMod(loader.Module):
         if not self.config["github_token"]:
             await utils.answer(message, self.strings("no_config"))
             return
-        
+
         owner = self.config["repo_owner"]
         repo = self.config["repo_name"]
-        
         if not owner or not repo:
             await utils.answer(message, self.strings("no_repo_set"))
             return
-            
+
         status_message = await utils.answer(message, self.strings("downloading"))
-        
+
         try:
             file_bytes = await reply.download_media(bytes)
         except Exception as e:
@@ -886,7 +1183,6 @@ class GitHubManagerMod(loader.Module):
             return
 
         await self._ensure_session()
-
         if not self.session:
             await utils.answer(status_message, self.strings("no_config"))
             return
@@ -895,85 +1191,76 @@ class GitHubManagerMod(loader.Module):
 
     async def _upload_file(self, message: Message, content_bytes: bytes, owner: str, repo: str, path: str, commit_msg: str, is_update: bool = False):
         """Основная логика загрузки/обновления файла через GitHub API."""
-        
-        # ИЗМЕНЕНИЕ 6.3.5: Удаление префикса диска Windows из пути перед API-запросом.
-        processed_path = WINDOWS_DRIVE_PREFIX_REGEX.sub("", path)
-        
-        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=processed_path.lstrip('/'))
-        
-        await utils.answer(message, self.strings("uploading").format(owner=utils.escape_html(owner), repo=utils.escape_html(repo), path=utils.escape_html(processed_path)))
-        
+
+        processed_path = self._normalize_repo_path(path)
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=processed_path)
+
+        await utils.answer(
+            message,
+            self.strings("uploading").format(
+                owner=utils.escape_html(owner),
+                repo=utils.escape_html(repo),
+                path=utils.escape_html(processed_path),
+            ),
+        )
+
         sha = None
         try:
-            # Шаг 1: Проверка существования файла для получения SHA (для обновления)
             async with self.session.get(url) as response:
                 if response.status == 200:
                     file_data = await response.json()
                     sha = file_data.get("sha")
-                    if is_update and not sha:
-                         pass
                 elif response.status == 404:
                     if is_update:
                         await utils.answer(message, self.strings("api_error").format(
-                            status=404, 
-                            error=f"Файл <code>{processed_path}</code> не найден в репозитории <code>{owner}/{repo}</code>. Для создания используйте <code>.ghupload</code>."
+                            status=404,
+                            error=(
+                                f"Файл <code>{utils.escape_html(processed_path)}</code> не найден "
+                                f"в репозитории <code>{utils.escape_html(owner)}/{utils.escape_html(repo)}</code>. "
+                                "Для создания используйте <code>.ghupload</code>."
+                            ),
                         ))
                         return
-                    pass
                 else:
-                    error_json = await response.json()
-                    error_message = error_json.get("message", "Неизвестная ошибка")
+                    error_message = await self._read_github_error(response)
                     raise aiohttp.ClientResponseError(
-                        response.request_info, response.history, 
-                        status=response.status, 
-                        message=error_message
+                        response.request_info,
+                        response.history,
+                        status=response.status,
+                        message=error_message,
                     )
-
-            # Шаг 2: Загрузка нового контента
-            encoded_content = base64.b64encode(content_bytes).decode('utf-8')
 
             payload = {
                 "message": commit_msg,
-                "content": encoded_content,
+                "content": base64.b64encode(content_bytes).decode("utf-8"),
             }
             if sha:
                 payload["sha"] = sha
-            
+
             async with self.session.put(url, json=payload) as response:
                 response_json = await response.json()
-                
+
                 if response.status in (200, 201):
-                    commit_type = "create" if response.status == 201 else "update"
-                    download_url = response_json["content"]["download_url"]
-                    
-                    if commit_type == "create":
-                        result_string = self.strings("success_create").format(
-                            path=utils.escape_html(processed_path),
-                            url=download_url
-                        )
-                    else:
-                        result_string = self.strings("success_update").format(
-                            path=utils.escape_html(processed_path),
-                            url=download_url
-                        )
-                    
-                    await utils.answer(message, result_string)
-                else:
-                    error_message = response_json.get("message", "Неизвестная ошибка")
-                    error_string = self.strings("api_error").format(
-                        status=response.status,
-                        error=utils.escape_html(error_message)
-                    )
-                    await utils.answer(message, error_string)
+                    download_url = response_json.get("content", {}).get("download_url", "")
+                    result_key = "success_create" if response.status == 201 else "success_update"
+                    await utils.answer(message, self.strings(result_key).format(
+                        path=utils.escape_html(processed_path),
+                        url=download_url,
+                    ))
+                    return
+
+                error_message = response_json.get("message", "Неизвестная ошибка")
+                await utils.answer(message, self.strings("api_error").format(
+                    status=response.status,
+                    error=utils.escape_html(error_message),
+                ))
 
         except aiohttp.ClientResponseError as e:
-            error_string = self.strings("api_error").format(
+            await utils.answer(message, self.strings("api_error").format(
                 status=e.status,
-                error=utils.escape_html(e.message)
-            )
-            await utils.answer(message, error_string)
+                error=utils.escape_html(e.message),
+            ))
             logger.exception(e)
-
         except Exception as e:
             await utils.answer(message, self.strings("internal_error").format(str(e)))
             logger.exception(e)
