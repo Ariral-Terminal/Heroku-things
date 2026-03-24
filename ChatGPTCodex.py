@@ -2,7 +2,7 @@
 #  Copyright (c) 2025 Senko
 #  This software is released under the MIT License.
 #  https://opensource.org/licenses/MIT
-__version__ = (7, 1, 0)
+__version__ = (7, 3, 0)
 # meta developer: forked by @desertedowl / origin module dev @senkoguardianmodules
 import re
 import os
@@ -89,6 +89,9 @@ class ChatGPTCodex(loader.Module):
         "cfg_chatgpt_model_doc": "Модель OpenAI API для текстовых ответов.",
         "cfg_codex_path_doc": "Путь до бинарника codex. Для Heroku можно указать полный путь, если codex не находится через PATH.",
         "cfg_codex_model_doc": "Модель для Codex CLI. Оставьте пустым, чтобы использовать дефолт CLI.",
+        "cfg_codex_yolo_mode_doc": "YOLO mode для Codex CLI: отключает sandbox и подтверждения. Codex сможет выполнять команды и менять файлы без вопросов. Опасно.",
+        "cfg_codex_auto_install_doc": "Автоматически ставить Codex CLI, если он не найден.",
+        "cfg_codex_install_dir_doc": "Куда автоматически ставить Codex CLI. Пусто = ~/.chatgptcodex/codex-cli",
         "cfg_image_model_doc": "Модель OpenAI Image API (например: gpt-image-1.5).",
         "cfg_buttons_doc": "Включить интерактивные кнопки.",
         "cfg_system_instruction_doc": "Системный промпт для ChatGPT/Codex.",
@@ -112,6 +115,11 @@ class ChatGPTCodex(loader.Module):
         "invalid_api_key": '❗️ <b>OpenAI API key недействителен.</b>\nПроверьте ключ и права проекта в <a href="https://platform.openai.com/settings/organization/api-keys">OpenAI API keys</a>.',
         "no_codex_login": "❗️ <b>Codex CLI не авторизован.</b>\nВойдите в shell через <code>codex login</code> или выполните <code>.cgauth codex</code>.",
         "codex_not_found": "❗️ <b>Команда <code>codex</code> не найдена в системе.</b>\nПроверьте PATH или заполните <code>codex_path</code> в cfg.",
+        "codex_prepare": "⌛️ <b>Проверяю Codex CLI...</b>",
+        "codex_installing": "⬇️ <b>Codex CLI не найден. Ставлю автоматически...</b>",
+        "codex_install_done": "✅ <b>Codex CLI установлен автоматически.</b>\n<code>{}</code>",
+        "codex_install_failed": "❗️ <b>Не удалось автоматически установить Codex CLI.</b>\n<code>{}</code>",
+        "codex_npm_missing": "❗️ <b>Команда <code>npm</code> не найдена, автоматическая установка Codex CLI невозможна.</b>",
         "processing": "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Обработка...</b>",
         "image_processing": "<emoji document_id=5325547803936572038>✨</emoji> <b>Генерирую изображение...</b>",
         "api_timeout": f"❗️ <b>Таймаут ответа от backend ({REQUEST_TIMEOUT} сек).</b>",
@@ -191,7 +199,7 @@ class ChatGPTCodex(loader.Module):
         "cgauth_usage": (
             "ℹ️ <b>Авторизация:</b>\n"
             "• <code>.cgauth status</code> — показать статус\n"
-            "• <code>.cgauth codex</code> — device auth для Codex CLI\n"
+            "• <code>.cgauth codex</code> — автоустановка Codex CLI + device auth\n"
             "• <code>.cgauth apikey sk-...</code> — сохранить OpenAI API key\n"
             "• <code>.cgauth clear</code> — удалить сохраненный API key"
         ),
@@ -220,6 +228,7 @@ class ChatGPTCodex(loader.Module):
         "status_backend": "• Backend: <code>{}</code>",
         "status_chatgpt": "• ChatGPT API key: {}",
         "status_codex": "• Codex CLI: {}",
+        "status_codex_yolo": "• Codex YOLO: <code>{}</code>",
         "status_set": "настроен",
         "status_missing": "не настроен",
         "status_logged_in": "авторизован",
@@ -268,6 +277,24 @@ class ChatGPTCodex(loader.Module):
                 "codex_model",
                 "",
                 self.strings["cfg_codex_model_doc"],
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "codex_yolo_mode",
+                False,
+                self.strings["cfg_codex_yolo_mode_doc"],
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "codex_auto_install",
+                True,
+                self.strings["cfg_codex_auto_install_doc"],
+                validator=loader.validators.Boolean(),
+            ),
+            loader.ConfigValue(
+                "codex_install_dir",
+                "",
+                self.strings["cfg_codex_install_dir_doc"],
                 validator=loader.validators.String(),
             ),
             loader.ConfigValue(
@@ -386,6 +413,7 @@ class ChatGPTCodex(loader.Module):
         self.cgimg_request_cache = {}
         self.cgimg_last_request_by_chat = {}
         self.cgimg_request_by_message = {}
+        self._codex_install_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
         self.client = client
@@ -1075,13 +1103,15 @@ class ChatGPTCodex(loader.Module):
             return await utils.answer(message, self._handle_error(RuntimeError(info)))
 
         if action == "codex":
-            codex_path = self._get_codex_binary()
-            if not codex_path:
-                return await utils.answer(message, self.strings["codex_not_found"])
+            status_msg = await utils.answer(message, self.strings["codex_prepare"])
+            try:
+                await self._ensure_codex_available(status_msg=status_msg)
+            except Exception as e:
+                return await utils.answer(status_msg, self._handle_error(e))
             logged_in, status = await self._get_codex_status_for_runtime()
             if logged_in:
-                return await utils.answer(message, self.strings["codex_auth_already"].format(utils.escape_html(status)))
-            status_msg = await utils.answer(message, self.strings["codex_auth_running"])
+                return await utils.answer(status_msg, self.strings["codex_auth_already"].format(utils.escape_html(status)))
+            await utils.answer(status_msg, self.strings["codex_auth_running"])
             ok, output = await self._run_codex_device_auth(status_msg=status_msg)
             key = "codex_auth_done" if ok else "codex_auth_failed"
             return await utils.answer(status_msg, self.strings[key].format(utils.escape_html(output)))
@@ -1482,6 +1512,7 @@ class ChatGPTCodex(loader.Module):
                     f"🔀 <b>Backend:</b> <code>{self.config['backend']}</code>\n"
                     f"🧠 <b>ChatGPT:</b> <code>{utils.escape_html(self.config['chatgpt_model'])}</code>\n"
                     f"🛠 <b>Codex:</b> <code>{utils.escape_html(self.config['codex_model'] or 'default')}</code>\n"
+                    f"🔥 <b>Codex YOLO:</b> <code>{'on' if self.config['codex_yolo_mode'] else 'off'}</code>\n"
                     f"🎨 <b>Image:</b> <code>{utils.escape_html(self.config['image_model_name'])}</code>"
                 ),
             )
@@ -1783,9 +1814,7 @@ class ChatGPTCodex(loader.Module):
         gauto: bool = False,
         history_override=None,
     ):
-        codex_path = self._get_codex_binary()
-        if not codex_path:
-            raise RuntimeError(self.strings["codex_not_found"])
+        codex_path = await self._ensure_codex_available()
         logged_in, status = await self._get_codex_status_for_runtime()
         if not logged_in:
             raise RuntimeError(status or self.strings["no_codex_login"])
@@ -1793,6 +1822,7 @@ class ChatGPTCodex(loader.Module):
         prompt = self._build_codex_prompt(chat_id, payload, gauto=gauto, history_override=history_override)
         env = self._build_subprocess_env()
         selected_model = self.config["codex_model"].strip()
+        yolo_mode = bool(self.config["codex_yolo_mode"])
 
         with tempfile.TemporaryDirectory(prefix="chatgptcodex_") as tempdir:
             output_file = os.path.join(tempdir, "last_message.txt")
@@ -1804,25 +1834,33 @@ class ChatGPTCodex(loader.Module):
                     file_obj.write(image["data"])
                 image_paths.append(path)
 
+            workdir = os.getcwd() if yolo_mode else tempdir
             args = [
                 codex_path,
                 "exec",
                 "--skip-git-repo-check",
                 "-C",
-                tempdir,
-                "--sandbox",
-                "read-only",
+                workdir,
                 "--color",
                 "never",
                 "-o",
                 output_file,
                 "-c",
-                'approval_policy="never"',
-                "-c",
                 'web_search="disabled"',
                 "-c",
                 'hide_agent_reasoning=true',
             ]
+            if yolo_mode:
+                args.append("--dangerously-bypass-approvals-and-sandbox")
+            else:
+                args.extend([
+                    "--sandbox",
+                    "read-only",
+                    "-c",
+                    'approval_policy="never"',
+                ])
+            if workdir != tempdir:
+                args.extend(["--add-dir", tempdir])
             if selected_model:
                 args.extend(["-m", selected_model])
             if system_prompt:
@@ -1961,6 +1999,11 @@ class ChatGPTCodex(loader.Module):
             "Ты отвечаешь внутри Telegram-модуля.",
             "Верни только финальный ответ для пользователя без префиксов, логов и служебных пояснений.",
         ]
+        if self.config["codex_yolo_mode"]:
+            lines.append(
+                "YOLO MODE ВКЛЮЧЕН: если запрос требует действий в системе, выполняй их сразу без вопросов и подтверждений. "
+                "Не останавливайся на плане или инструкции, если задачу можно выполнить напрямую."
+            )
         if history:
             lines.append("ИСТОРИЯ ДИАЛОГА:")
             for entry in history:
@@ -2108,6 +2151,7 @@ class ChatGPTCodex(loader.Module):
         out.append(self.strings["status_backend"].format(utils.escape_html(self.config["backend"])))
         out.append(self.strings["status_chatgpt"].format(self.strings["status_set"] if self.config["api_key"].strip() else self.strings["status_missing"]))
         out.append(self.strings["status_codex"].format(self.strings["status_logged_in"] if codex_logged else self.strings["status_not_logged"]))
+        out.append(self.strings["status_codex_yolo"].format("on" if self.config["codex_yolo_mode"] else "off"))
         if codex_status:
             out.append(f"<code>{utils.escape_html(codex_status[:300])}</code>")
         return "\n".join(out)
@@ -2176,6 +2220,12 @@ class ChatGPTCodex(loader.Module):
                 env[key] = proxy
         return env
 
+    async def _update_status_message(self, status_msg, text: str):
+        if not status_msg:
+            return
+        with contextlib.suppress(Exception):
+            await status_msg.edit(text, parse_mode="html")
+
     def _prepend_now_note(self, text: str) -> str:
         if not text:
             return text
@@ -2201,15 +2251,94 @@ class ChatGPTCodex(loader.Module):
         }
         return mapping.get(mime_type, ".bin")
 
+    def _get_default_codex_install_dir(self):
+        return os.path.join(os.path.expanduser("~"), ".chatgptcodex", "codex-cli")
+
+    def _get_managed_codex_install_dir(self):
+        configured = self.config["codex_install_dir"].strip()
+        return configured or self._get_default_codex_install_dir()
+
+    def _get_managed_codex_binary(self):
+        install_dir = self._get_managed_codex_install_dir()
+        return os.path.join(install_dir, "bin", "codex")
+
     def _get_codex_binary(self):
         configured = self.config["codex_path"].strip()
         if configured:
             if "/" in configured:
                 return configured if os.path.exists(configured) else None
             return shutil.which(configured)
+        managed = self._get_managed_codex_binary()
+        if os.path.exists(managed):
+            return managed
         return shutil.which("codex")
 
+    async def _install_codex_cli(self, status_msg=None):
+        async with self._codex_install_lock:
+            current = self._get_codex_binary()
+            if current:
+                return current
+
+            npm_path = shutil.which("npm")
+            if not npm_path:
+                raise RuntimeError(self.strings["codex_npm_missing"])
+
+            install_dir = self._get_managed_codex_install_dir()
+            os.makedirs(install_dir, exist_ok=True)
+            await self._update_status_message(status_msg, self.strings["codex_installing"])
+
+            env = self._build_subprocess_env()
+            env.setdefault("NPM_CONFIG_UPDATE_NOTIFIER", "false")
+            env.setdefault("NPM_CONFIG_FUND", "false")
+            env.setdefault("NPM_CONFIG_AUDIT", "false")
+
+            proc = await asyncio.create_subprocess_exec(
+                npm_path,
+                "install",
+                "-g",
+                "--prefix",
+                install_dir,
+                "@openai/codex",
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE,
+                env=env,
+            )
+            try:
+                stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+            except asyncio.TimeoutError:
+                proc.kill()
+                await proc.communicate()
+                raise RuntimeError("Автоустановка Codex CLI превысила таймаут (600 сек).")
+
+            output = "\n".join(
+                part for part in [
+                    stdout.decode("utf-8", errors="ignore").strip(),
+                    stderr.decode("utf-8", errors="ignore").strip(),
+                ] if part
+            ).strip()
+            managed = self._get_managed_codex_binary()
+            if proc.returncode != 0 or not os.path.exists(managed):
+                raise RuntimeError(self.strings["codex_install_failed"].format(utils.escape_html((output or f"npm exit={proc.returncode}")[:900])))
+
+            self.config["codex_path"] = managed
+            await self._update_status_message(status_msg, self.strings["codex_install_done"].format(utils.escape_html(managed)))
+            return managed
+
+    async def _ensure_codex_available(self, status_msg=None):
+        current = self._get_codex_binary()
+        if current:
+            if not self.config["codex_path"].strip() and current == self._get_managed_codex_binary():
+                self.config["codex_path"] = current
+            return current
+        if not self.config["codex_auto_install"]:
+            raise RuntimeError(self.strings["codex_not_found"])
+        return await self._install_codex_cli(status_msg=status_msg)
+
     async def _get_codex_status_for_runtime(self):
+        try:
+            await self._ensure_codex_available()
+        except Exception as e:
+            return False, str(e)
         logged_in, status = await self._get_codex_login_status()
         if logged_in:
             return True, status
