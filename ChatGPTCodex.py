@@ -2,7 +2,7 @@
 #  Copyright (c) 2025 Senko
 #  This software is released under the MIT License.
 #  https://opensource.org/licenses/MIT
-__version__ = (7, 3, 0)
+__version__ = (7, 3, 2)
 # meta developer: forked by @desertedowl / origin module dev @senkoguardianmodules
 import re
 import os
@@ -34,7 +34,14 @@ except ImportError:
     MarkdownIt = None
 
 from telethon import types as tg_types
-from telethon.tl.types import Message, DocumentAttributeFilename, DocumentAttributeSticker
+from telethon.tl.types import (
+    Message,
+    DocumentAttributeAnimated,
+    DocumentAttributeAudio,
+    DocumentAttributeFilename,
+    DocumentAttributeSticker,
+    DocumentAttributeVideo,
+)
 from telethon.utils import get_display_name, get_peer_id
 from telethon.errors.rpcerrorlist import (
     ChatAdminRequiredError,
@@ -78,6 +85,21 @@ IMAGE_MIME_TYPES = {
     "image/gif",
 }
 
+AUDIO_EXTENSIONS = {
+    "audio/mpeg": ".mp3",
+    "audio/mp3": ".mp3",
+    "audio/mp4": ".m4a",
+    "audio/x-m4a": ".m4a",
+    "audio/aac": ".aac",
+    "audio/ogg": ".ogg",
+    "audio/oga": ".ogg",
+    "audio/wav": ".wav",
+    "audio/x-wav": ".wav",
+    "audio/webm": ".webm",
+}
+
+REASONING_EFFORT_VALUES = ("none", "minimal", "low", "medium", "high", "xhigh")
+
 
 class ChatGPTCodex(loader.Module):
     """ChatGPT API + Codex CLI для Heroku"""
@@ -89,6 +111,7 @@ class ChatGPTCodex(loader.Module):
         "cfg_chatgpt_model_doc": "Модель OpenAI API для текстовых ответов.",
         "cfg_codex_path_doc": "Путь до бинарника codex. Для Heroku можно указать полный путь, если codex не находится через PATH.",
         "cfg_codex_model_doc": "Модель для Codex CLI. Оставьте пустым, чтобы использовать дефолт CLI.",
+        "cfg_reasoning_effort_doc": "Reasoning effort для поддерживаемых reasoning-моделей: none, minimal, low, medium, high, xhigh. Для Codex CLI значение none означает использовать дефолт модели без override.",
         "cfg_codex_yolo_mode_doc": "YOLO mode для Codex CLI: отключает sandbox и подтверждения. Codex сможет выполнять команды и менять файлы без вопросов. Опасно.",
         "cfg_codex_auto_install_doc": "Автоматически ставить Codex CLI, если он не найден.",
         "cfg_codex_install_dir_doc": "Куда автоматически ставить Codex CLI. Пусто = ~/.chatgptcodex/codex-cli",
@@ -104,6 +127,9 @@ class ChatGPTCodex(loader.Module):
         "cfg_impersonation_history_limit_doc": "Сколько последних сообщений из чата отправлять в качестве контекста для авто-ответа.",
         "cfg_impersonation_reply_chance_doc": "Вероятность ответа в режиме cgauto (от 0.0 до 1.0). 0.2 = 20% шанс.",
         "cfg_temperature_doc": "Температура генерации ChatGPT API. От 0.0 до 2.0.",
+        "cfg_autoretry_doc": "Сколько раз автоматически повторять текстовый запрос, если backend не вернул ответ или упал. 0 = выключено.",
+        "cfg_audio_transcribe_model_doc": "Модель OpenAI для транскрибации аудио/голосовых/музыки при анализе медиа.",
+        "cfg_media_frame_count_doc": "Сколько кадров извлекать из GIF/видео/анимированных стикеров для анализа.",
         "cfg_inline_pagination_doc": "Использовать инлайн-кнопки для длинных ответов.",
         "cfg_cgimg_history_limit_doc": "Сколько последних prompt-ов для cgimg хранить на чат.",
         "cfg_cgimg_upload_service_doc": "Сервис загрузки для кнопки cgimg upload: catbox, envs, kappa, oxo, x0, tmpfiles, pomf, bashupload.",
@@ -122,7 +148,9 @@ class ChatGPTCodex(loader.Module):
         "codex_npm_missing": "❗️ <b>Команда <code>npm</code> не найдена, автоматическая установка Codex CLI невозможна.</b>",
         "processing": "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Обработка...</b>",
         "image_processing": "<emoji document_id=5325547803936572038>✨</emoji> <b>Генерирую изображение...</b>",
+        "text_regenerating": "<emoji document_id=5386367538735104399>⌛️</emoji> <b>Генерирую другой ответ{}</b>",
         "api_timeout": f"❗️ <b>Таймаут ответа от backend ({REQUEST_TIMEOUT} сек).</b>",
+        "empty_backend_response": "Backend не вернул финальный ответ.",
         "generic_error": "❗️ <b>Ошибка:</b>\n<code>{}</code>",
         "question_prefix": "💬 <b>Запрос:</b>",
         "response_prefix": "<emoji document_id=5325547803936572038>✨</emoji> <b>{}:</b>",
@@ -140,6 +168,7 @@ class ChatGPTCodex(loader.Module):
         "btn_regenerate": "🔄 Другой ответ",
         "btn_retry_request": "🔄 Повторить запрос",
         "btn_cancel_request": "❌ Отменить запрос",
+        "request_cancelling": "⏳ Отменяю запрос...",
         "btn_cgimg_retry": "🔄 Повтор",
         "btn_cgimg_edit": "✏️ Изм. промпт",
         "btn_cgimg_history": "🕘 История",
@@ -196,6 +225,9 @@ class ChatGPTCodex(loader.Module):
         "cgprompt_not_text": "❗️ Это не похоже на текстовый файл.",
         "cgmodel_usage": "ℹ️ <b>Использование:</b> <code>.cgmodel [модель]</code>, <code>.cgmodel -s</code>, <code>.cgmodel [chatgpt/codex] [модель]</code>",
         "cgmodel_list_error": "❗️ Ошибка получения списка моделей: {}",
+        "cgmodel_reasoning_note": "ℹ️ <i>Reasoning effort применяется только на поддерживаемых reasoning-моделях.</i>",
+        "cgmodel_reasoning_updated": "✅ Reasoning effort: {}",
+        "cgmodel_reasoning_already": "Уже выбрано: {}",
         "cgauth_usage": (
             "ℹ️ <b>Авторизация:</b>\n"
             "• <code>.cgauth status</code> — показать статус\n"
@@ -217,6 +249,11 @@ class ChatGPTCodex(loader.Module):
         "cgpreset_list_head": "📋 <b>Ваши пресеты:</b>\n",
         "cgpreset_empty": "📂 Список пресетов пуст.",
         "unsupported_media": "⚠️ <b>Этот тип медиа пока не поддерживается для ChatGPT/Codex:</b> <code>{}</code>",
+        "media_ffmpeg_missing": "⚠️ <b>ffmpeg/ffprobe не найдены.</b> GIF, видео и анимированные стикеры будут доступны только как метаданные без кадров.",
+        "media_frame_extract_failed": "⚠️ <b>Не удалось извлечь кадры из медиа:</b> <code>{}</code>",
+        "media_audio_transcribe_failed": "⚠️ <b>Не удалось расшифровать аудио:</b> <code>{}</code>",
+        "media_sticker_download_failed": "⚠️ <b>Не удалось подготовить стикер для анализа:</b> <code>{}</code>",
+        "media_sticker_preview_used": "[Для анализа использовано превью стикера]",
         "auth_saved": "✅ <b>OpenAI API key сохранен и проверен.</b>",
         "auth_cleared": "🗑 <b>OpenAI API key удален.</b>",
         "backend_updated": "✅ <b>Backend переключен:</b> <code>{}</code>",
@@ -228,6 +265,7 @@ class ChatGPTCodex(loader.Module):
         "status_backend": "• Backend: <code>{}</code>",
         "status_chatgpt": "• ChatGPT API key: {}",
         "status_codex": "• Codex CLI: {}",
+        "status_reasoning": "• Reasoning effort: <code>{}</code>",
         "status_codex_yolo": "• Codex YOLO: <code>{}</code>",
         "status_set": "настроен",
         "status_missing": "не настроен",
@@ -278,6 +316,12 @@ class ChatGPTCodex(loader.Module):
                 "",
                 self.strings["cfg_codex_model_doc"],
                 validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "reasoning_effort",
+                "medium",
+                self.strings["cfg_reasoning_effort_doc"],
+                validator=loader.validators.Choice(list(REASONING_EFFORT_VALUES)),
             ),
             loader.ConfigValue(
                 "codex_yolo_mode",
@@ -383,6 +427,24 @@ class ChatGPTCodex(loader.Module):
                 validator=loader.validators.Float(minimum=0.0, maximum=2.0),
             ),
             loader.ConfigValue(
+                "autoretry",
+                0,
+                self.strings["cfg_autoretry_doc"],
+                validator=loader.validators.Integer(minimum=0, maximum=10),
+            ),
+            loader.ConfigValue(
+                "audio_transcribe_model",
+                "gpt-4o-mini-transcribe",
+                self.strings["cfg_audio_transcribe_model_doc"],
+                validator=loader.validators.String(),
+            ),
+            loader.ConfigValue(
+                "media_frame_count",
+                4,
+                self.strings["cfg_media_frame_count_doc"],
+                validator=loader.validators.Integer(minimum=1, maximum=8),
+            ),
+            loader.ConfigValue(
                 "inline_pagination",
                 False,
                 self.strings["cfg_inline_pagination_doc"],
@@ -413,6 +475,7 @@ class ChatGPTCodex(loader.Module):
         self.cgimg_request_cache = {}
         self.cgimg_last_request_by_chat = {}
         self.cgimg_request_by_message = {}
+        self.active_text_requests = {}
         self._codex_install_lock = asyncio.Lock()
 
     async def client_ready(self, client, db):
@@ -443,7 +506,7 @@ class ChatGPTCodex(loader.Module):
             except Exception:
                 pass
         if not payload:
-            return await utils.answer(status_msg, "⚠️ <i>Нужен текст, reply или изображение.</i>")
+            return await utils.answer(status_msg, "⚠️ <i>Нужен текст, reply или поддерживаемое медиа.</i>")
         await self._send_request(message=message, payload=payload, status_msg=status_msg)
 
     @loader.command()
@@ -662,11 +725,73 @@ class ChatGPTCodex(loader.Module):
             await asyncio.sleep(0.9)
 
     async def _cancel_cgimg_loading(self, task):
+        await self._cancel_loading_task(task)
+
+    def _build_text_regeneration_loading_text(self, display_prompt: str, suffix: str = "") -> str:
+        prompt = utils.escape_html((display_prompt or self.strings["media_reply_placeholder"])[:800])
+        return "\n".join([
+            self.strings["text_regenerating"].format(suffix),
+            self.strings["question_prefix"],
+            f"<blockquote>{prompt}</blockquote>",
+        ])
+
+    async def _animate_text_regeneration(self, call: InlineCall, display_prompt: str, chat_id: int, base_message_id: int):
+        suffixes = ["", ".", "..", "..."]
+        index = 0
+        while True:
+            try:
+                await call.edit(
+                    self._build_text_regeneration_loading_text(display_prompt, suffix=suffixes[index % len(suffixes)]),
+                    reply_markup=self._get_loading_buttons(chat_id, base_message_id),
+                )
+            except asyncio.CancelledError:
+                raise
+            except Exception:
+                return
+            index += 1
+            await asyncio.sleep(0.9)
+
+    async def _cancel_loading_task(self, task):
         if not task:
             return
         task.cancel()
         with contextlib.suppress(asyncio.CancelledError, Exception):
             await task
+
+    async def _delete_message_entity(self, entity):
+        if not entity:
+            return
+        with contextlib.suppress(Exception):
+            if hasattr(entity, "delete"):
+                await entity.delete()
+                return
+        chat_id = getattr(entity, "chat_id", None)
+        if chat_id is None:
+            chat_id = getattr(getattr(entity, "message", None), "chat_id", None)
+        message_id = self._extract_message_id(entity)
+        if chat_id and message_id:
+            with contextlib.suppress(Exception):
+                await self.client.delete_messages(chat_id, message_id)
+
+    async def _update_text_request_ui(self, entity, text: str, reply_markup=None):
+        if isinstance(entity, InlineCall):
+            await entity.edit(text, reply_markup=reply_markup)
+            return entity
+        if hasattr(entity, "edit"):
+            with contextlib.suppress(Exception):
+                await entity.edit(text, reply_markup=reply_markup)
+                return entity
+        updated = await utils.answer(entity, text, reply_markup=reply_markup)
+        if updated and self._extract_message_id(updated) != self._extract_message_id(entity):
+            await self._delete_message_entity(entity)
+        return updated or entity
+
+    async def _set_text_request_loading_ui(self, entity, text: str, chat_id: int, base_message_id: int):
+        return await self._update_text_request_ui(
+            entity,
+            text,
+            reply_markup=self._get_loading_buttons(chat_id, base_message_id),
+        )
 
     async def _restart_cgimg_as_loading_message(self, call: InlineCall, request_data: dict):
         old_message_id = self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call)
@@ -1506,16 +1631,7 @@ class ChatGPTCodex(loader.Module):
         await self._sync_runtime_config()
         args_raw = utils.get_args_raw(message).strip()
         if not args_raw:
-            return await utils.answer(
-                message,
-                (
-                    f"🔀 <b>Backend:</b> <code>{self.config['backend']}</code>\n"
-                    f"🧠 <b>ChatGPT:</b> <code>{utils.escape_html(self.config['chatgpt_model'])}</code>\n"
-                    f"🛠 <b>Codex:</b> <code>{utils.escape_html(self.config['codex_model'] or 'default')}</code>\n"
-                    f"🔥 <b>Codex YOLO:</b> <code>{'on' if self.config['codex_yolo_mode'] else 'off'}</code>\n"
-                    f"🎨 <b>Image:</b> <code>{utils.escape_html(self.config['image_model_name'])}</code>"
-                ),
-            )
+            return await utils.answer(message, self._build_cgmodel_panel_text(), reply_markup=self._get_reasoning_effort_buttons())
 
         args_list = args_raw.split()
         is_list = "-s" in [arg.lower() for arg in args_list]
@@ -1588,6 +1704,10 @@ class ChatGPTCodex(loader.Module):
             uid = parts[2]
             page = int(parts[3])
             await self._render_page(uid, page, call)
+            return
+        if action == "re":
+            effort = parts[2] if len(parts) > 2 else ""
+            await self._set_reasoning_effort_callback(call, effort)
 
     @loader.watcher(only_incoming=True, ignore_edited=True)
     async def watcher(self, message: Message):
@@ -1634,6 +1754,7 @@ class ChatGPTCodex(loader.Module):
         impersonation_mode: bool = False,
     ):
         msg_obj = None
+        current_task = asyncio.current_task()
         if regeneration:
             chat_id = chat_id_override
             base_message_id = message
@@ -1641,15 +1762,27 @@ class ChatGPTCodex(loader.Module):
                 msg_obj = await self.client.get_messages(chat_id, ids=base_message_id)
             except Exception:
                 msg_obj = None
-            current_payload, display_prompt = self.last_requests.get(f"{chat_id}:{base_message_id}", (payload, payload.get("display_prompt") or self.strings["media_reply_placeholder"]))
+            current_payload, display_prompt, retry_count = self._normalize_last_request_state(
+                self.last_requests.get(f"{chat_id}:{base_message_id}"),
+                fallback_payload=payload,
+            )
+            retry_count += 1
+            self._set_last_request_state(chat_id, base_message_id, current_payload, display_prompt, retry_count)
         else:
             chat_id = utils.get_chat_id(message)
             base_message_id = message.id
             msg_obj = message
             current_payload = payload
             display_prompt = payload.get("display_prompt") or self.strings["media_reply_placeholder"]
-            self.last_requests[f"{chat_id}:{base_message_id}"] = (current_payload, display_prompt)
+            retry_count = 0
+            self._set_last_request_state(chat_id, base_message_id, current_payload, display_prompt, retry_count)
 
+        request_key = self._get_text_request_key(chat_id, base_message_id)
+        if not impersonation_mode and current_task:
+            self.active_text_requests[request_key] = {"task": current_task}
+
+        loading_task = None
+        status_entity = status_msg
         try:
             if impersonation_mode:
                 my_name = get_display_name(self.me)
@@ -1658,8 +1791,38 @@ class ChatGPTCodex(loader.Module):
             else:
                 system_prompt = (self.config["system_instruction"].strip() or None)
 
-            result = await self._run_backend_request(chat_id, current_payload, system_prompt=system_prompt, gauto=impersonation_mode, regeneration=regeneration)
-            result_text = result["text"].strip()
+            if regeneration and call:
+                loading_task = asyncio.create_task(self._animate_text_regeneration(call, display_prompt, chat_id, base_message_id))
+            elif status_msg and not impersonation_mode:
+                status_entity = await self._set_text_request_loading_ui(
+                    status_entity,
+                    getattr(status_msg, "text", None) or self.strings["processing"],
+                    chat_id,
+                    base_message_id,
+                )
+
+            autoretry_left = max(0, int(self.config["autoretry"]))
+            while True:
+                try:
+                    result = await self._run_backend_request(
+                        chat_id,
+                        current_payload,
+                        system_prompt=system_prompt,
+                        gauto=impersonation_mode,
+                        regeneration=regeneration,
+                    )
+                    result_text = (result.get("text") or "").strip()
+                    if not result_text:
+                        raise RuntimeError(self.strings["empty_backend_response"])
+                    break
+                except Exception as e:
+                    if autoretry_left <= 0 or not self._should_autoretry_backend_error(e):
+                        raise
+                    autoretry_left -= 1
+                    retry_count += 1
+                    self._set_last_request_state(chat_id, base_message_id, current_payload, display_prompt, retry_count)
+                    await asyncio.sleep(1)
+
             label = result["label"]
             model_name = result["model"]
 
@@ -1688,6 +1851,8 @@ class ChatGPTCodex(loader.Module):
             buttons = self._get_inline_buttons(chat_id, base_message_id) if self.config["interactive_buttons"] else None
 
             if len(result_text) > 3500 and self.config["inline_pagination"]:
+                await self._cancel_loading_task(loading_task)
+                loading_task = None
                 chunks = self._paginate_text(result_text, 3000)
                 uid = uuid.uuid4().hex[:6]
                 header = (
@@ -1702,34 +1867,61 @@ class ChatGPTCodex(loader.Module):
                     "chat_id": chat_id,
                     "msg_id": base_message_id,
                 }
-                await self._render_page(uid, 0, call or status_msg)
+                await self._render_page(uid, 0, call or status_entity)
             elif len(text_to_send) > 4096:
+                await self._cancel_loading_task(loading_task)
+                loading_task = None
                 file = io.BytesIO(result_text.encode("utf-8"))
                 file.name = "chatgptcodex_response.txt"
                 if call:
                     await call.answer("Ответ длинный, отправляю файлом...", show_alert=False)
-                    await self.client.send_file(call.chat_id, file, caption=self.strings["response_too_long"], reply_to=call.message_id)
-                elif status_msg:
-                    await status_msg.delete()
+                    await self.client.send_file(
+                        call.chat_id,
+                        file,
+                        caption=self.strings["response_too_long"],
+                        reply_to=self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call),
+                    )
+                elif status_entity:
+                    await self._delete_message_entity(status_entity)
                     await self.client.send_file(chat_id, file, caption=self.strings["response_too_long"], reply_to=reply_target_id)
             else:
+                await self._cancel_loading_task(loading_task)
+                loading_task = None
                 if call:
                     await call.edit(text_to_send, reply_markup=buttons)
-                elif status_msg:
-                    await utils.answer(status_msg, text_to_send, reply_markup=buttons)
+                elif status_entity:
+                    status_entity = await self._update_text_request_ui(status_entity, text_to_send, reply_markup=buttons)
+        except asyncio.CancelledError:
+            await self._cancel_loading_task(loading_task)
+            loading_task = None
+            self.last_requests.pop(request_key, None)
+            if not impersonation_mode:
+                with contextlib.suppress(Exception):
+                    if call:
+                        await call.edit(self.strings["request_cancelled"], reply_markup=None)
+                    elif status_entity:
+                        await self._update_text_request_ui(status_entity, self.strings["request_cancelled"], reply_markup=None)
+            return None if impersonation_mode else ""
         except Exception as e:
             error_text = self._handle_error(e)
             if impersonation_mode:
                 logger.error("cgauto backend error: %s", error_text)
             elif call:
+                await self._cancel_loading_task(loading_task)
+                loading_task = None
                 await call.edit(error_text, reply_markup=self._get_error_buttons(chat_id, base_message_id))
-            elif status_msg:
+            elif status_entity:
                 buttons = self._get_error_buttons(chat_id, base_message_id)
                 try:
-                    await utils.answer(status_msg, error_text, reply_markup=buttons)
+                    status_entity = await self._update_text_request_ui(status_entity, error_text, reply_markup=buttons)
                 except Exception:
-                    target_message = msg_obj or status_msg
-                    await utils.answer(target_message, error_text, reply_markup=buttons)
+                    target_message = msg_obj or status_entity
+                    await self._update_text_request_ui(target_message, error_text, reply_markup=buttons)
+        finally:
+            await self._cancel_loading_task(loading_task)
+            active = self.active_text_requests.get(request_key)
+            if active and active.get("task") is current_task:
+                self.active_text_requests.pop(request_key, None)
         return None if impersonation_mode else ""
 
     async def _run_backend_request(
@@ -1785,6 +1977,9 @@ class ChatGPTCodex(loader.Module):
             "text": {"format": {"type": "text"}},
             "temperature": float(self.config["temperature"]),
         }
+        reasoning_effort = self._get_chatgpt_reasoning_effort(model)
+        if reasoning_effort is not None:
+            body["reasoning"] = {"effort": reasoning_effort}
         if system_prompt:
             body["instructions"] = system_prompt
 
@@ -1822,6 +2017,7 @@ class ChatGPTCodex(loader.Module):
         prompt = self._build_codex_prompt(chat_id, payload, gauto=gauto, history_override=history_override)
         env = self._build_subprocess_env()
         selected_model = self.config["codex_model"].strip()
+        reasoning_effort = self._get_codex_reasoning_effort()
         yolo_mode = bool(self.config["codex_yolo_mode"])
 
         with tempfile.TemporaryDirectory(prefix="chatgptcodex_") as tempdir:
@@ -1863,6 +2059,8 @@ class ChatGPTCodex(loader.Module):
                 args.extend(["--add-dir", tempdir])
             if selected_model:
                 args.extend(["-m", selected_model])
+            if reasoning_effort:
+                args.extend(["-c", f"model_reasoning_effort={self._toml_string(reasoning_effort)}"])
             if system_prompt:
                 args.extend(["-c", f"developer_instructions={self._toml_string(system_prompt)}"])
             for image_path in image_paths:
@@ -1876,7 +2074,15 @@ class ChatGPTCodex(loader.Module):
                 env=env,
             )
             try:
-                stdout, stderr = await asyncio.wait_for(proc.communicate(prompt.encode("utf-8")), timeout=CODEX_TIMEOUT)
+                stdout, stderr = await asyncio.wait_for(
+                    proc.communicate(prompt.encode("utf-8")),
+                    timeout=CODEX_TIMEOUT,
+                )
+            except asyncio.CancelledError:
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.communicate()
+                raise
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
@@ -1905,6 +2111,7 @@ class ChatGPTCodex(loader.Module):
         warnings = []
         prompt_chunks = []
         images = []
+        default_media_instruction = None
         user_args = custom_text if custom_text is not None else utils.get_args_raw(message).strip()
         reply = await message.get_reply_message()
 
@@ -1926,28 +2133,113 @@ class ChatGPTCodex(loader.Module):
         has_media = bool(media_source and (media_source.media or media_source.sticker))
         if has_media:
             if media_source.sticker:
-                alt_text = "?"
-                attrs = getattr(media_source.sticker, "attributes", []) or []
-                alt_text = next((attr.alt for attr in attrs if isinstance(attr, DocumentAttributeSticker)), "?")
-                prompt_chunks.append(f"[Стикер: {alt_text}]")
+                document = media_source.sticker
+                mime_type = getattr(document, "mime_type", "application/octet-stream") or "application/octet-stream"
+                filename = self._get_document_filename(document, mime_type, default="sticker")
+                sticker_attr = self._get_sticker_attribute(document)
+                video_attr = self._get_video_attribute(document)
+                alt_text = getattr(sticker_attr, "alt", None) or "?"
+                is_video_sticker = self._is_video_sticker(media_source, mime_type, document)
+                is_animated_sticker = self._is_animated_sticker(mime_type, filename)
+
+                prompt_chunks.append(
+                    self._format_sticker_metadata(
+                        alt_text,
+                        filename,
+                        mime_type,
+                        is_video_sticker=is_video_sticker,
+                        is_animated_sticker=is_animated_sticker,
+                        video_attr=video_attr,
+                    )
+                )
+                default_media_instruction = "Проанализируй приложенный стикер и ответь по содержимому."
+
+                if mime_type.startswith("image/") and not is_animated_sticker:
+                    try:
+                        data = await self.client.download_media(media_source, bytes)
+                        if not data:
+                            raise RuntimeError("sticker download failed")
+                        images.append({"mime_type": mime_type, "data": data, "filename": filename})
+                    except Exception as e:
+                        preview = await self._download_media_preview_image(media_source, os.path.splitext(filename)[0] or "sticker")
+                        if preview:
+                            images.append(preview)
+                            prompt_chunks.append(self.strings["media_sticker_preview_used"])
+                        else:
+                            warnings.append(self.strings["media_sticker_download_failed"].format(utils.escape_html(str(e))))
+                else:
+                    try:
+                        frame_count = min(3, int(self.config["media_frame_count"]))
+                        frames = await self._extract_visual_frames_from_message(media_source, mime_type, filename, frame_count)
+                        images.extend(frames)
+                        prompt_chunks.append(f"[Из стикера извлечено кадров: {len(frames)}]")
+                    except Exception as e:
+                        msg = str(e)
+                        if msg.startswith("⚠️"):
+                            warnings.append(msg)
+                        else:
+                            warnings.append(self.strings["media_frame_extract_failed"].format(utils.escape_html(msg)))
+                        preview = await self._download_media_preview_image(media_source, os.path.splitext(filename)[0] or "sticker")
+                        if preview:
+                            images.append(preview)
+                            prompt_chunks.append(self.strings["media_sticker_preview_used"])
             elif media_source.photo:
                 data = await self.client.download_media(media_source, bytes)
                 images.append({"mime_type": "image/jpeg", "data": data, "filename": "photo.jpg"})
+                default_media_instruction = "Опиши и обработай приложенное изображение."
             elif getattr(media_source, "document", None):
-                mime_type = getattr(media_source.document, "mime_type", "application/octet-stream") or "application/octet-stream"
-                doc_attr = next(
-                    (attr for attr in media_source.document.attributes if isinstance(attr, DocumentAttributeFilename)),
-                    None,
-                )
-                filename = doc_attr.file_name if doc_attr else "file"
-                if mime_type.startswith("image/"):
+                document = media_source.document
+                mime_type = getattr(document, "mime_type", "application/octet-stream") or "application/octet-stream"
+                filename = self._get_document_filename(document, mime_type)
+                audio_attr = self._get_audio_attribute(document)
+                video_attr = self._get_video_attribute(document)
+                gif_like = self._is_gif_like_media(media_source, mime_type, document)
+
+                if mime_type.startswith("image/") and not gif_like:
                     data = await self.client.download_media(media_source, bytes)
                     images.append({"mime_type": mime_type, "data": data, "filename": filename})
+                    default_media_instruction = "Опиши и обработай приложенное изображение."
+                elif gif_like or mime_type.startswith("video/") or video_attr:
+                    prompt_chunks.append(self._format_video_metadata(filename, mime_type, video_attr, gif_like=gif_like))
+                    default_media_instruction = "Проанализируй приложенные кадры из GIF/видео и ответь по содержимому."
+                    try:
+                        frame_count = min(3, int(self.config["media_frame_count"])) if gif_like else int(self.config["media_frame_count"])
+                        frames = await self._extract_visual_frames_from_message(media_source, mime_type, filename, frame_count)
+                        images.extend(frames)
+                        prompt_chunks.append(f"[Из медиа извлечено кадров: {len(frames)}]")
+                    except Exception as e:
+                        msg = str(e)
+                        if msg.startswith("⚠️"):
+                            warnings.append(msg)
+                        else:
+                            warnings.append(self.strings["media_frame_extract_failed"].format(utils.escape_html(msg)))
+                elif audio_attr or mime_type.startswith("audio/") or getattr(media_source, "voice", False):
+                    prompt_chunks.append(self._format_audio_metadata(filename, mime_type, audio_attr))
+                    default_media_instruction = "Проанализируй приложенное аудио или музыку и ответь по содержимому."
+                    transcribe_prompt = None
+                    prompt_parts = []
+                    if getattr(audio_attr, "performer", None):
+                        prompt_parts.append(f"Performer: {audio_attr.performer}")
+                    if getattr(audio_attr, "title", None):
+                        prompt_parts.append(f"Title: {audio_attr.title}")
+                    if prompt_parts:
+                        transcribe_prompt = ". ".join(prompt_parts)
+                    try:
+                        transcript = await self._transcribe_audio_from_message(media_source, mime_type, filename, prompt=transcribe_prompt)
+                        if transcript:
+                            prompt_chunks.append("[Транскрипция аудио]:\n" + transcript)
+                    except Exception as e:
+                        msg = str(e)
+                        if msg.startswith("⚠️"):
+                            warnings.append(msg)
+                        else:
+                            warnings.append(self.strings["media_audio_transcribe_failed"].format(utils.escape_html(msg)))
                 elif mime_type in TEXT_MIME_TYPES or filename.split(".")[-1].lower() in {"txt", "py", "js", "json", "md", "html", "css", "sh"}:
                     try:
                         data = await self.client.download_media(media_source, bytes)
-                        file_content = data.decode("utf-8")
+                        file_content = data.decode("utf-8", errors="ignore")
                         prompt_chunks.insert(0, f"[Содержимое файла '{filename}']:\n```\n{file_content}\n```")
+                        default_media_instruction = "Проанализируй содержимое приложенного файла."
                     except Exception as e:
                         warnings.append(f"⚠️ Ошибка чтения файла '{filename}': {e}")
                 else:
@@ -1956,7 +2248,9 @@ class ChatGPTCodex(loader.Module):
         if user_args:
             prompt_chunks.append(f"{current_user_name}: {user_args}")
         elif images:
-            prompt_chunks.append(f"{current_user_name}: Опиши и обработай приложенное изображение.")
+            prompt_chunks.append(f"{current_user_name}: {default_media_instruction or 'Опиши и обработай приложенное медиа.'}")
+        elif default_media_instruction:
+            prompt_chunks.append(f"{current_user_name}: {default_media_instruction}")
         elif reply and getattr(reply, "text", None):
             prompt_chunks.append(f"{current_user_name}: Ответь на сообщение выше.")
 
@@ -2151,10 +2445,64 @@ class ChatGPTCodex(loader.Module):
         out.append(self.strings["status_backend"].format(utils.escape_html(self.config["backend"])))
         out.append(self.strings["status_chatgpt"].format(self.strings["status_set"] if self.config["api_key"].strip() else self.strings["status_missing"]))
         out.append(self.strings["status_codex"].format(self.strings["status_logged_in"] if codex_logged else self.strings["status_not_logged"]))
+        out.append(self.strings["status_reasoning"].format(utils.escape_html(self._get_reasoning_effort())))
         out.append(self.strings["status_codex_yolo"].format("on" if self.config["codex_yolo_mode"] else "off"))
         if codex_status:
             out.append(f"<code>{utils.escape_html(codex_status[:300])}</code>")
         return "\n".join(out)
+
+    def _get_reasoning_effort(self) -> str:
+        effort = str(self.config["reasoning_effort"] or "medium").strip().lower()
+        return effort if effort in REASONING_EFFORT_VALUES else "medium"
+
+    def _supports_responses_reasoning_effort(self, model: str) -> bool:
+        model_name = (model or "").strip().lower()
+        return model_name.startswith(("gpt-5", "o1", "o3", "o4"))
+
+    def _get_chatgpt_reasoning_effort(self, model: str):
+        if not self._supports_responses_reasoning_effort(model):
+            return None
+        return self._get_reasoning_effort()
+
+    def _get_codex_reasoning_effort(self):
+        effort = self._get_reasoning_effort()
+        return None if effort == "none" else effort
+
+    def _build_cgmodel_panel_text(self) -> str:
+        return (
+            f"🔀 <b>Backend:</b> <code>{utils.escape_html(self.config['backend'])}</code>\n"
+            f"🧠 <b>ChatGPT:</b> <code>{utils.escape_html(self.config['chatgpt_model'])}</code>\n"
+            f"🛠 <b>Codex:</b> <code>{utils.escape_html(self.config['codex_model'] or 'default')}</code>\n"
+            f"🧩 <b>Reasoning:</b> <code>{utils.escape_html(self._get_reasoning_effort())}</code>\n"
+            f"🔥 <b>Codex YOLO:</b> <code>{'on' if self.config['codex_yolo_mode'] else 'off'}</code>\n"
+            f"🎨 <b>Image:</b> <code>{utils.escape_html(self.config['image_model_name'])}</code>\n\n"
+            f"{self.strings['cgmodel_reasoning_note']}"
+        )
+
+    def _get_reasoning_effort_buttons(self):
+        values = list(REASONING_EFFORT_VALUES)
+        current = self._get_reasoning_effort()
+        rows = []
+        for index in range(0, len(values), 3):
+            row = []
+            for effort in values[index:index + 3]:
+                is_active = effort == current
+                row.append({
+                    "text": f"• {effort}" if is_active else effort,
+                    "data": "chatgptcodex:noop" if is_active else f"chatgptcodex:re:{effort}",
+                })
+            rows.append(row)
+        return rows
+
+    async def _set_reasoning_effort_callback(self, call: InlineCall, effort: str):
+        effort = (effort or "").strip().lower()
+        if effort not in REASONING_EFFORT_VALUES:
+            return await call.answer("Unsupported reasoning effort.", show_alert=True)
+        if effort == self._get_reasoning_effort():
+            return await call.answer(self.strings["cgmodel_reasoning_already"].format(effort), show_alert=False)
+        self.config["reasoning_effort"] = effort
+        await call.edit(self._build_cgmodel_panel_text(), reply_markup=self._get_reasoning_effort_buttons())
+        await call.answer(self.strings["cgmodel_reasoning_updated"].format(utils.escape_html(effort)), show_alert=False)
 
     def _extract_openai_output_text(self, data: dict) -> str:
         texts = []
@@ -2248,8 +2596,305 @@ class ChatGPTCodex(loader.Module):
             "image/png": ".png",
             "image/webp": ".webp",
             "image/gif": ".gif",
+            "application/x-tgsticker": ".tgs",
+            "video/mp4": ".mp4",
+            "video/webm": ".webm",
+            "video/quicktime": ".mov",
+            "audio/mpeg": ".mp3",
+            "audio/mp3": ".mp3",
+            "audio/mp4": ".m4a",
+            "audio/x-m4a": ".m4a",
+            "audio/aac": ".aac",
+            "audio/ogg": ".ogg",
+            "audio/oga": ".ogg",
+            "audio/wav": ".wav",
+            "audio/x-wav": ".wav",
+            "audio/webm": ".webm",
         }
         return mapping.get(mime_type, ".bin")
+
+    def _get_document_filename(self, document, mime_type: str = "", default: str = "file") -> str:
+        if document:
+            for attr in getattr(document, "attributes", []) or []:
+                if isinstance(attr, DocumentAttributeFilename) and getattr(attr, "file_name", None):
+                    return attr.file_name
+        ext = self._guess_extension(mime_type) if mime_type else ""
+        return f"{default}{ext}"
+
+    def _get_audio_attribute(self, document):
+        if not document:
+            return None
+        return next((attr for attr in getattr(document, "attributes", []) or [] if isinstance(attr, DocumentAttributeAudio)), None)
+
+    def _get_sticker_attribute(self, document):
+        if not document:
+            return None
+        return next((attr for attr in getattr(document, "attributes", []) or [] if isinstance(attr, DocumentAttributeSticker)), None)
+
+    def _get_video_attribute(self, document):
+        if not document:
+            return None
+        return next((attr for attr in getattr(document, "attributes", []) or [] if isinstance(attr, DocumentAttributeVideo)), None)
+
+    def _is_animated_sticker(self, mime_type: str, filename: str = "") -> bool:
+        mime = (mime_type or "").strip().lower()
+        name = (filename or "").strip().lower()
+        return mime == "application/x-tgsticker" or name.endswith(".tgs")
+
+    def _is_video_sticker(self, message: Message, mime_type: str, document) -> bool:
+        if not getattr(message, "sticker", None):
+            return False
+        if (mime_type or "").strip().lower() == "video/webm":
+            return True
+        return self._get_video_attribute(document) is not None
+
+    def _is_gif_like_media(self, message: Message, mime_type: str, document) -> bool:
+        if mime_type == "image/gif":
+            return True
+        if getattr(message, "gif", False):
+            return True
+        return any(isinstance(attr, DocumentAttributeAnimated) for attr in (getattr(document, "attributes", []) or []))
+
+    def _detect_image_mime_type(self, data: bytes):
+        if not data:
+            return None
+        if data.startswith(b"\xff\xd8\xff"):
+            return "image/jpeg"
+        if data.startswith(b"\x89PNG\r\n\x1a\n"):
+            return "image/png"
+        if data[:6] in {b"GIF87a", b"GIF89a"}:
+            return "image/gif"
+        if data[:4] == b"RIFF" and data[8:12] == b"WEBP":
+            return "image/webp"
+        return None
+
+    async def _download_media_preview_image(self, media_source: Message, base_name: str = "preview"):
+        for thumb in (-1, 0, 1):
+            with contextlib.suppress(Exception):
+                data = await self.client.download_media(media_source, file=bytes, thumb=thumb)
+                mime_type = self._detect_image_mime_type(data)
+                if not mime_type:
+                    continue
+                return {
+                    "mime_type": mime_type,
+                    "data": data,
+                    "filename": f"{base_name}{self._guess_extension(mime_type)}",
+                }
+        return None
+
+    async def _run_media_tool(self, *args, timeout: int = 120):
+        proc = await asyncio.create_subprocess_exec(
+            *args,
+            stdout=asyncio.subprocess.PIPE,
+            stderr=asyncio.subprocess.PIPE,
+            env=self._build_subprocess_env(),
+        )
+        try:
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=timeout)
+        except asyncio.TimeoutError:
+            proc.kill()
+            await proc.communicate()
+            raise RuntimeError(f"{os.path.basename(args[0])} timeout")
+        return proc.returncode, stdout.decode("utf-8", errors="ignore").strip(), stderr.decode("utf-8", errors="ignore").strip()
+
+    async def _probe_media_duration(self, input_path: str):
+        ffprobe = shutil.which("ffprobe")
+        if not ffprobe:
+            return None
+        code, stdout, _ = await self._run_media_tool(
+            ffprobe,
+            "-v",
+            "error",
+            "-show_entries",
+            "format=duration",
+            "-of",
+            "default=noprint_wrappers=1:nokey=1",
+            input_path,
+            timeout=30,
+        )
+        if code != 0 or not stdout:
+            return None
+        try:
+            duration = float(stdout.strip())
+        except Exception:
+            return None
+        return duration if duration > 0 else None
+
+    def _build_media_frame_timestamps(self, duration, frame_count: int):
+        if frame_count <= 1 or not duration or duration <= 0:
+            return [0.0]
+        upper = max(0.0, duration - 0.05)
+        if upper <= 0:
+            return [0.0]
+        points = []
+        for index in range(frame_count):
+            ts = round(duration * (index + 1) / (frame_count + 1), 2)
+            points.append(min(upper, max(0.0, ts)))
+        result = []
+        seen = set()
+        for ts in points:
+            if ts in seen:
+                continue
+            seen.add(ts)
+            result.append(ts)
+        return result or [0.0]
+
+    async def _extract_visual_frames_from_message(self, media_source: Message, mime_type: str, filename: str, frame_count: int):
+        ffmpeg = shutil.which("ffmpeg")
+        ffprobe = shutil.which("ffprobe")
+        if not ffmpeg or not ffprobe:
+            raise RuntimeError(self.strings["media_ffmpeg_missing"])
+
+        frame_count = max(1, min(int(frame_count or 1), 8))
+        stem, _ = os.path.splitext(filename or "media")
+        with tempfile.TemporaryDirectory(prefix="chatgptcodex_media_") as tempdir:
+            ext = os.path.splitext(filename or "")[1] or self._guess_extension(mime_type)
+            input_path = os.path.join(tempdir, f"input{ext}")
+            saved = await self.client.download_media(media_source, file=input_path)
+            if not saved or not os.path.exists(input_path):
+                raise RuntimeError("media download failed")
+
+            duration = await self._probe_media_duration(input_path)
+            timestamps = self._build_media_frame_timestamps(duration, frame_count)
+            frames = []
+            for index, ts in enumerate(timestamps, start=1):
+                output_path = os.path.join(tempdir, f"frame_{index}.jpg")
+                args = [
+                    ffmpeg,
+                    "-loglevel",
+                    "error",
+                    "-y",
+                ]
+                if ts > 0:
+                    args.extend(["-ss", f"{ts:.2f}"])
+                args.extend([
+                    "-i",
+                    input_path,
+                    "-frames:v",
+                    "1",
+                    "-vf",
+                    "scale=min(1280\\,iw):-2",
+                    "-q:v",
+                    "3",
+                    output_path,
+                ])
+                code, _, stderr = await self._run_media_tool(*args, timeout=120)
+                if code != 0:
+                    logger.warning("ChatGPTCodex: ffmpeg frame extraction failed: %s", stderr or code)
+                    continue
+                if not os.path.exists(output_path) or os.path.getsize(output_path) <= 0:
+                    continue
+                with open(output_path, "rb") as file_obj:
+                    frame_data = file_obj.read()
+                if not frame_data:
+                    continue
+                frames.append({
+                    "mime_type": "image/jpeg",
+                    "data": frame_data,
+                    "filename": f"{stem or 'frame'}_{index}.jpg",
+                })
+            if not frames:
+                raise RuntimeError("no frames extracted")
+            return frames
+
+    async def _transcribe_audio_from_message(self, media_source: Message, mime_type: str, filename: str, prompt: str = None):
+        if not aiohttp:
+            return None
+        api_key = self.config["api_key"].strip()
+        if not api_key:
+            return None
+        model = self.config["audio_transcribe_model"].strip() or "gpt-4o-mini-transcribe"
+        headers = {"Authorization": f"Bearer {api_key}"}
+        proxy = self._get_proxy()
+
+        with tempfile.TemporaryDirectory(prefix="chatgptcodex_audio_") as tempdir:
+            ext = os.path.splitext(filename or "")[1] or AUDIO_EXTENSIONS.get(mime_type) or self._guess_extension(mime_type)
+            input_path = os.path.join(tempdir, f"audio{ext}")
+            saved = await self.client.download_media(media_source, file=input_path)
+            if not saved or not os.path.exists(input_path):
+                raise RuntimeError("audio download failed")
+
+            form = aiohttp.FormData()
+            form.add_field("model", model)
+            form.add_field("response_format", "json")
+            if prompt:
+                form.add_field("prompt", prompt[:1000])
+
+            with open(input_path, "rb") as file_obj:
+                form.add_field("file", file_obj, filename=filename or os.path.basename(input_path), content_type=mime_type or "application/octet-stream")
+                async with aiohttp.ClientSession(headers=headers) as session:
+                    async with session.post(
+                        "https://api.openai.com/v1/audio/transcriptions",
+                        data=form,
+                        proxy=proxy,
+                        timeout=REQUEST_TIMEOUT,
+                    ) as resp:
+                        raw = await resp.text()
+                        if resp.status != 200:
+                            raise RuntimeError(self._parse_openai_error(resp.status, raw))
+                        data = json.loads(raw)
+            return (data.get("text") or "").strip()
+
+    def _format_audio_metadata(self, filename: str, mime_type: str, audio_attr) -> str:
+        details = []
+        if filename:
+            details.append(f"файл={filename}")
+        if getattr(audio_attr, "performer", None):
+            details.append(f"исполнитель={audio_attr.performer}")
+        if getattr(audio_attr, "title", None):
+            details.append(f"название={audio_attr.title}")
+        if getattr(audio_attr, "duration", None):
+            details.append(f"длительность={audio_attr.duration}с")
+        if getattr(audio_attr, "voice", False):
+            details.append("тип=voice")
+        elif mime_type:
+            details.append(f"MIME={mime_type}")
+        return "[Аудио: " + ", ".join(details or ["без метаданных"]) + "]"
+
+    def _format_sticker_metadata(
+        self,
+        alt_text: str,
+        filename: str,
+        mime_type: str,
+        is_video_sticker: bool = False,
+        is_animated_sticker: bool = False,
+        video_attr=None,
+    ) -> str:
+        details = []
+        if alt_text and alt_text != "?":
+            details.append(f"emoji={alt_text}")
+        if filename:
+            details.append(f"файл={filename}")
+        if getattr(video_attr, "duration", None):
+            details.append(f"длительность={video_attr.duration}с")
+        width = getattr(video_attr, "w", None)
+        height = getattr(video_attr, "h", None)
+        if width and height:
+            details.append(f"размер={width}x{height}")
+        if mime_type:
+            details.append(f"MIME={mime_type}")
+        if is_video_sticker:
+            details.append("тип=video-sticker")
+        elif is_animated_sticker:
+            details.append("тип=animated-sticker")
+        else:
+            details.append("тип=static-sticker")
+        return "[Стикер: " + ", ".join(details or ["без метаданных"]) + "]"
+
+    def _format_video_metadata(self, filename: str, mime_type: str, video_attr, gif_like: bool = False) -> str:
+        details = []
+        if filename:
+            details.append(f"файл={filename}")
+        if getattr(video_attr, "duration", None):
+            details.append(f"длительность={video_attr.duration}с")
+        width = getattr(video_attr, "w", None)
+        height = getattr(video_attr, "h", None)
+        if width and height:
+            details.append(f"размер={width}x{height}")
+        if mime_type:
+            details.append(f"MIME={mime_type}")
+        label = "GIF/анимация" if gif_like else "Видео"
+        return f"[{label}: " + ", ".join(details or ["без метаданных"]) + "]"
 
     def _get_default_codex_install_dir(self):
         return os.path.join(os.path.expanduser("~"), ".chatgptcodex", "codex-cli")
@@ -2305,6 +2950,11 @@ class ChatGPTCodex(loader.Module):
             )
             try:
                 stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=600)
+            except asyncio.CancelledError:
+                proc.kill()
+                with contextlib.suppress(Exception):
+                    await proc.communicate()
+                raise
             except asyncio.TimeoutError:
                 proc.kill()
                 await proc.communicate()
@@ -2578,15 +3228,78 @@ class ChatGPTCodex(loader.Module):
                 return nested_reply_id
         return getattr(message, "id", None) or fallback
 
+    def _normalize_last_request_state(self, state, fallback_payload: dict = None):
+        payload = fallback_payload or {}
+        display_prompt = payload.get("display_prompt") or self.strings["media_reply_placeholder"]
+        retry_count = 0
+        if isinstance(state, dict):
+            payload = state.get("payload") or payload
+            display_prompt = state.get("display_prompt") or payload.get("display_prompt") or display_prompt
+            retry_count = state.get("retry_count", 0) or 0
+        elif isinstance(state, (tuple, list)):
+            if len(state) > 0 and state[0]:
+                payload = state[0]
+            if len(state) > 1 and state[1]:
+                display_prompt = state[1]
+            if len(state) > 2:
+                retry_count = state[2] or 0
+        try:
+            retry_count = max(0, int(retry_count))
+        except Exception:
+            retry_count = 0
+        return payload, display_prompt, retry_count
+
+    def _set_last_request_state(self, chat_id: int, base_message_id: int, payload: dict, display_prompt: str, retry_count: int = 0):
+        self.last_requests[f"{chat_id}:{base_message_id}"] = {
+            "payload": payload,
+            "display_prompt": display_prompt,
+            "retry_count": max(0, int(retry_count or 0)),
+        }
+
+    def _get_text_request_key(self, chat_id: int, base_message_id: int) -> str:
+        return f"{chat_id}:{base_message_id}"
+
+    def _get_last_request_retry_count(self, chat_id: int, base_message_id: int) -> int:
+        _, _, retry_count = self._normalize_last_request_state(self.last_requests.get(f"{chat_id}:{base_message_id}"))
+        return retry_count
+
+    def _format_retry_button_text(self, text: str, retry_count: int) -> str:
+        return f"{text} [{max(0, int(retry_count or 0))}]"
+
+    def _should_autoretry_backend_error(self, error: Exception) -> bool:
+        if isinstance(error, asyncio.TimeoutError):
+            return True
+        msg = str(error or "")
+        if not msg:
+            return True
+        permanent_markers = (
+            "OpenAI API key не настроен",
+            "OpenAI API key недействителен",
+            "Codex CLI не авторизован",
+            "Команда <code>codex</code> не найдена",
+            "Команда <code>npm</code> не найдена",
+            "Библиотека aiohttp не установлена",
+            "Rate limit / quota exceeded",
+            "OpenAI API error 4",
+        )
+        return not any(marker in msg for marker in permanent_markers)
+
     def _get_inline_buttons(self, chat_id, base_message_id):
+        retry_count = self._get_last_request_retry_count(chat_id, base_message_id)
         return [[
             {"text": self.strings["btn_clear"], "callback": self._clear_callback, "args": (chat_id,)},
-            {"text": self.strings["btn_regenerate"], "callback": self._regenerate_callback, "args": (base_message_id, chat_id)},
+            {"text": self._format_retry_button_text(self.strings["btn_regenerate"], retry_count), "callback": self._regenerate_callback, "args": (base_message_id, chat_id)},
+        ]]
+
+    def _get_loading_buttons(self, chat_id, base_message_id):
+        return [[
+            {"text": self.strings["btn_cancel_request"], "callback": self._cancel_request_callback, "args": (base_message_id, chat_id)},
         ]]
 
     def _get_error_buttons(self, chat_id, base_message_id):
+        retry_count = self._get_last_request_retry_count(chat_id, base_message_id)
         return [[
-            {"text": self.strings["btn_retry_request"], "callback": self._regenerate_callback, "args": (base_message_id, chat_id)},
+            {"text": self._format_retry_button_text(self.strings["btn_retry_request"], retry_count), "callback": self._regenerate_callback, "args": (base_message_id, chat_id)},
             {"text": self.strings["btn_cancel_request"], "callback": self._cancel_request_callback, "args": (base_message_id, chat_id)},
         ]]
 
@@ -2595,21 +3308,32 @@ class ChatGPTCodex(loader.Module):
         await call.edit(self.strings["memory_cleared"], reply_markup=None)
 
     async def _regenerate_callback(self, call: InlineCall, mid, cid):
-        key = f"{cid}:{mid}"
+        key = self._get_text_request_key(cid, mid)
         if key not in self.last_requests:
             return await call.answer(self.strings["no_last_request"], show_alert=True)
-        payload, _ = self.last_requests[key]
+        payload, _, _ = self._normalize_last_request_state(self.last_requests.get(key))
         await self._send_request(mid, payload, regeneration=True, call=call, chat_id_override=cid)
 
     async def _cancel_request_callback(self, call: InlineCall, mid, cid):
-        self.last_requests.pop(f"{cid}:{mid}", None)
+        key = self._get_text_request_key(cid, mid)
+        active = self.active_text_requests.get(key)
+        task = active.get("task") if active else None
+        if task and not task.done():
+            with contextlib.suppress(Exception):
+                await call.answer(self.strings["request_cancelling"], show_alert=False)
+            task.cancel()
+            return
+        self.last_requests.pop(key, None)
         await call.edit(self.strings["request_cancelled"], reply_markup=None)
 
     async def _close_callback(self, call: InlineCall, uid: str):
         await call.answer()
         self.pager_cache.pop(uid, None)
         try:
-            await self.client.delete_messages(call.chat_id, call.message_id)
+            await self.client.delete_messages(
+                call.chat_id,
+                self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call),
+            )
         except Exception:
             try:
                 await call.edit("✔️ Сессия закрыта.", reply_markup=None)
@@ -2640,7 +3364,9 @@ class ChatGPTCodex(loader.Module):
             extra_row.append({"text": "🔄", "callback": self._regenerate_callback, "args": (data["msg_id"], data["chat_id"])})
         buttons = [nav_row, extra_row]
         if isinstance(entity, Message):
-            await self.inline.form(text=text_to_show, message=entity, reply_markup=buttons)
+            form = await self.inline.form(text=text_to_show, message=entity, reply_markup=buttons)
+            if form:
+                await self._delete_message_entity(entity)
         elif isinstance(entity, InlineCall):
             await entity.edit(text=text_to_show, reply_markup=buttons)
         elif hasattr(entity, "edit"):
