@@ -70,7 +70,6 @@ class GitHubManagerMod(loader.Module):
             "    - <code>repo_name</code>: Имя целевого репозитория (например, <code>userbot_files</code>).\n\n"
             "### 💾 Использование\n"
             "Команда: <code>ghupload</code> [сообщение коммита]\n"
-            "    или <code>ghupload -m \"сообщение коммита\"</code>\n"
             "<b>Действие:</b> Ответьте этой командой на сообщение с файлом.\n"
             "    - Файл будет загружен или обновлен (если уже существует).\n"
             "    - <b>[сообщение коммита]</b> — опционально. Если не указано, используется имя файла.\n\n"
@@ -141,6 +140,7 @@ class GitHubManagerMod(loader.Module):
         self.temp_update_path = {}
         # Pre-stored reply message when user calls .ghupdate as reply to a file
         self.temp_update_reply: dict = {}
+        self.temp_update_commit: dict = {}
     async def on_unload(self):
         if self.session and not self.session.closed:
             await self.session.close()
@@ -240,11 +240,52 @@ class GitHubManagerMod(loader.Module):
                 return message.id
         return None
 
+    def _extract_chat_id(self, obj: Any) -> Optional[int]:
+        """Извлекает chat_id из Message/InlineCall-подобных объектов."""
+
+        if obj is None:
+            return None
+
+        chat_id = getattr(obj, "chat_id", None)
+        if isinstance(chat_id, int) and chat_id != 0:
+            return chat_id
+
+        chat = getattr(obj, "chat", None)
+        if chat is not None:
+            chat_id = getattr(chat, "id", None)
+            if isinstance(chat_id, int) and chat_id != 0:
+                return chat_id
+
+        peer = getattr(obj, "peer_id", None)
+        if peer is not None:
+            for attr in ("channel_id", "chat_id", "user_id"):
+                value = getattr(peer, attr, None)
+                if isinstance(value, int) and value != 0:
+                    return value
+
+        message = getattr(obj, "message", None)
+        if message is not None and message is not obj:
+            return self._extract_chat_id(message)
+
+        return None
+
     async def _close_inline_message(self, call: Message, fallback_text: str = "✔️ Меню закрыто."):
-        """Закрывает inline-сообщение через редактирование текущей формы."""
+        """Пытается удалить inline-сообщение и только потом фолбэчит в edit."""
 
         with contextlib.suppress(Exception):
             await call.answer()
+
+        msg_id = self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call)
+        chat_id = self._extract_chat_id(call)
+
+        with contextlib.suppress(Exception):
+            if self._client and chat_id and msg_id:
+                await self._client.delete_messages(chat_id, msg_id)
+                return
+
+        with contextlib.suppress(Exception):
+            await call.delete()
+            return
 
         with contextlib.suppress(Exception):
             await call.edit(text=fallback_text, reply_markup=None)
@@ -252,14 +293,6 @@ class GitHubManagerMod(loader.Module):
 
         with contextlib.suppress(Exception):
             await call.edit(fallback_text, reply_markup=None)
-            return
-
-        with contextlib.suppress(Exception):
-            msg_id = self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call)
-            chat_id = getattr(call, "chat_id", None)
-            if self._client and chat_id and msg_id:
-                await self._client.delete_messages(chat_id, msg_id)
-                return
 
     async def _answer_or_edit(self, entity: Message, text: str, reply_markup=None):
         """Редактирует текущее сообщение, если возможно, иначе отправляет новый ответ."""
@@ -348,13 +381,13 @@ class GitHubManagerMod(loader.Module):
 
 
     @loader.command(
-        ru_doc="[сообщение коммита] или -m <сообщение> - Загружает файл из ответа. Использует оригинальное имя файла.",
-        en_doc="[commit message] or -m <message> - Uploads file from reply. Uses original file name."
+        ru_doc="[сообщение коммита] - Загружает файл из ответа. Использует оригинальное имя файла. Сообщение коммита опционально.",
+        en_doc="[commit message] - Uploads file from reply. Uses original file name. Commit message is optional."
     )
     async def ghuploadcmd(self, message: Message):
         """Загрузка нового файла в GitHub repository."""
         
-        commit_message = self._parse_commit_message(utils.get_args_raw(message))
+        commit_message = utils.get_args_raw(message).strip()
         
         reply = await message.get_reply_message()
         if not reply or not reply.media:
@@ -368,22 +401,22 @@ class GitHubManagerMod(loader.Module):
             return
 
         if not commit_message:
-            commit_message = f"File upload: {file_path}"
+            commit_message = f"File upload: {utils.escape_html(file_path)}"
         
         await self._process_upload(message, reply, file_path, commit_message, is_update=False)
 
 
     @loader.command(
-        ru_doc="<путь_к_файлу> [сообщение коммита] - Обновляет файл в репозитории по указанному пути, используя файл из ответа. Если путь не указан, открывает интерактивный выбор файла. Если команда вызвана реплаем, использует путь из режима ожидания.",
-        en_doc="<file_path> [commit message] - Updates a file at the specified path, using the file from the reply. If no path is specified, opens an interactive file selector. If called as a reply, uses the path from the waiting mode."
+        ru_doc="Только reply на файл. <путь_к_файлу> [сообщение коммита] или <путь_к_файлу> -m <сообщение> - Обновляет файл в репозитории по указанному пути. Если путь не указан, открывает интерактивный выбор файла.",
+        en_doc="Reply to a file only. <file_path> [commit message] or <file_path> -m <message> - Updates a file at the specified repository path. If no path is specified, opens an interactive file selector."
     )
     async def ghupdatecmd(self, message: Message):
         """Интерактивное или прямое обновление существующего файла в GitHub repository."""
 
         user_id = message.sender_id
-        args = utils.get_args(message)
         reply = await message.get_reply_message()
-        stored_reply = self.temp_update_reply.get(user_id)
+        raw_args = utils.get_args_raw(message).strip()
+        repo_path, commit_message = self._parse_update_args(raw_args)
 
         if not self.config["github_token"]:
             await utils.answer(message, self.strings("no_config"))
@@ -395,102 +428,58 @@ class GitHubManagerMod(loader.Module):
         if not owner or not repo:
             await utils.answer(message, self.strings("no_repo_set"))
             return
-        
-        # --- ЛОГИКА РЕЖИМА ОЖИДАНИЯ (интерактивный режим) ---
-        if reply and reply.media and user_id in self.temp_update_path:
-            # 1. Мы в режиме ожидания (пользователь выбрал файл, и теперь отвечает новым файлом)
-            repo_path = self.temp_update_path[user_id]
-            
-            commit_message = self._parse_commit_message(utils.get_args_raw(message))
-            
-            # Сообщение коммита по умолчанию
-            if not commit_message:
-                commit_message = f"File update: {repo_path}"
 
-            try:
-                # Выполняем обновление
-                await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
-            finally:
-                # ГАРАНТИРОВАННЫЙ СБРОС СЕССИИ
-                self.temp_update_path.pop(user_id, None)
-                self.temp_update_reply.pop(user_id, None)
+        if not reply or not reply.media:
+            await utils.answer(message, self.strings("no_reply"))
             return
 
-        if not reply and stored_reply and user_id in self.temp_update_path:
-            repo_path = self.temp_update_path[user_id]
-            commit_message = self._parse_commit_message(utils.get_args_raw(message))
+        self.temp_update_path.pop(user_id, None)
+        self.temp_update_reply.pop(user_id, None)
+        self.temp_update_commit.pop(user_id, None)
 
-            if not commit_message:
-                commit_message = f"File update: {repo_path}"
-
-            try:
-                await self._process_upload(message, stored_reply, repo_path, commit_message, is_update=True)
-            finally:
-                self.temp_update_path.pop(user_id, None)
-                self.temp_update_reply.pop(user_id, None)
-            return
-            
-        # --- ЛОГИКА ПРЯМОГО ВЫЗОВА / ИНТЕРАКТИВНОГО ЗАПУСКА ---
-        
-        if args:
-            # 2. Прямое обновление: .ghupdate path/to/file commit message (как раньше)
-            repo_path = args[0]
-            commit_message = " ".join(args[1:])
-            
-            if not reply or not reply.media:
-                await utils.answer(message, self.strings("no_reply"))
-                return
-
+        if repo_path:
             if not commit_message:
                 default_name = self._get_file_name(reply) or "новый файл"
                 commit_message = f"File update: {repo_path} (from {default_name})"
 
-            try:
-                await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
-            finally:
-                self.temp_update_reply.pop(user_id, None)
-        
-        elif reply and reply.media:
-            # 3. Reply to a file: try to auto-detect the repository path by file name first.
-            reply_file_name = self._get_file_name(reply)
-            if reply_file_name:
-                matches = await self._find_repo_matches_for_file(owner, repo, reply_file_name)
-                if len(matches) == 1:
-                    repo_path = matches[0]
+            await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
+            return
+
+        reply_file_name = self._get_file_name(reply)
+        if reply_file_name:
+            matches = await self._find_repo_matches_for_file(owner, repo, reply_file_name)
+            if len(matches) == 1:
+                repo_path = matches[0]
+                if not commit_message:
                     commit_message = f"File update: {repo_path}"
-                    status_message = await utils.answer(
-                        message,
-                        self.strings("update_auto_found").format(path=utils.escape_html(repo_path)),
-                    )
-                    await self._process_upload(status_message, reply, repo_path, commit_message, is_update=True)
-                    return
+                status_message = await utils.answer(
+                    message,
+                    self.strings("update_auto_found").format(path=utils.escape_html(repo_path)),
+                )
+                await self._process_upload(status_message, reply, repo_path, commit_message, is_update=True)
+                return
 
-                if len(matches) > 1:
-                    status_message = await utils.answer(
-                        message,
-                        self.strings("update_auto_ambiguous").format(
-                            filename=utils.escape_html(reply_file_name),
-                            count=len(matches),
-                        ),
-                    )
-                else:
-                    status_message = await utils.answer(
-                        message,
-                        self.strings("update_auto_not_found").format(
-                            filename=utils.escape_html(reply_file_name),
-                        ),
-                    )
+            if len(matches) > 1:
+                status_message = await utils.answer(
+                    message,
+                    self.strings("update_auto_ambiguous").format(
+                        filename=utils.escape_html(reply_file_name),
+                        count=len(matches),
+                    ),
+                )
             else:
-                status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
-
-            self.temp_update_reply[user_id] = reply
-            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
-            
+                status_message = await utils.answer(
+                    message,
+                    self.strings("update_auto_not_found").format(
+                        filename=utils.escape_html(reply_file_name),
+                    ),
+                )
         else:
-            # 4. Интерактивное обновление: .ghupdate (открываем браузер файлов)
             status_message = await utils.answer(message, "⏳ Загружаю содержимое репозитория...")
-            
-            await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
+
+        self.temp_update_reply[user_id] = reply
+        self.temp_update_commit[user_id] = commit_message
+        await self._send_file_list(status_message, owner, repo, "", original_message=message, mode="update")
 
     @loader.command(
         ru_doc="[путь] - Показывает файлы репозитория в виде копируемых строк. Лимит страниц задается в конфиге.",
@@ -589,6 +578,26 @@ class GitHubManagerMod(loader.Module):
             commit_message = commit_message[1:-1].strip()
 
         return commit_message
+
+    def _parse_update_args(self, raw_args: str) -> tuple[str, str]:
+        """Разделяет аргументы .ghupdate на путь и commit message."""
+
+        cleaned_args = raw_args.strip()
+        if not cleaned_args:
+            return "", ""
+
+        if cleaned_args.startswith(("-m ", "--message ")):
+            return "", self._parse_commit_message(cleaned_args)
+
+        repo_path, separator, remainder = cleaned_args.partition(" ")
+        if not separator:
+            return repo_path.strip(), ""
+
+        remainder = remainder.strip()
+        if remainder.startswith(("-m ", "--message ")):
+            return repo_path.strip(), self._parse_commit_message(remainder)
+
+        return repo_path.strip(), remainder
 
     async def _read_github_error(self, response: aiohttp.ClientResponse) -> str:
         """Безопасно достает сообщение об ошибке из ответа GitHub API."""
@@ -860,9 +869,11 @@ class GitHubManagerMod(loader.Module):
                 })
             if nav_buttons:
                 buttons.append(nav_buttons)
+            current_chat_id = self._extract_chat_id(message) or 0
+            current_message_id = self._extract_message_id(getattr(message, "message", None)) or self._extract_message_id(message) or 0
             buttons.append([{
                 "text": self.strings("files_list_close"),
-                "action": "close",
+                "data": f"ghfl_close:{current_chat_id}|{current_message_id}",
             }])
 
             await self._answer_or_edit(message, "\n".join(lines), reply_markup=buttons)
@@ -917,6 +928,7 @@ class GitHubManagerMod(loader.Module):
             if user_id:
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
+                self.temp_update_commit.pop(user_id, None)
 
             await self._close_inline_message(call)
             return
@@ -941,22 +953,47 @@ class GitHubManagerMod(loader.Module):
             return
 
         path = data[len("ghmu_file:"):]
+        stored_reply = self.temp_update_reply.get(user_id)
+        stored_commit = self.temp_update_commit.get(user_id, "")
         self.temp_update_path[user_id] = path
 
-        prompt_key = "update_prompt_saved_reply" if user_id in self.temp_update_reply else "update_prompt"
+        if stored_reply and getattr(stored_reply, "media", None):
+            if not stored_commit:
+                stored_commit = f"File update: {path}"
+
+            try:
+                await call.edit(
+                    self.strings("update_prompt").format(path=utils.escape_html(path)),
+                    reply_markup=None,
+                )
+            except Exception:
+                pass
+
+            try:
+                await call.answer(f"Выбран файл: {path}. Обновляю файл в GitHub.")
+            except Exception:
+                pass
+
+            try:
+                await self._process_upload(call, stored_reply, path, stored_commit, is_update=True)
+            finally:
+                self.temp_update_path.pop(user_id, None)
+                self.temp_update_reply.pop(user_id, None)
+                self.temp_update_commit.pop(user_id, None)
+            return
+
+        self.temp_update_reply.pop(user_id, None)
+        self.temp_update_commit.pop(user_id, None)
+
         await call.edit(
-            self.strings(prompt_key).format(path=utils.escape_html(path)),
+            self.strings("update_prompt").format(path=utils.escape_html(path)),
             reply_markup=[[{
                 "text": self.strings("update_cancel"),
                 "data": "ghmu_close",
             }]]
         )
 
-        alert_text = (
-            f"Выбран файл: {path}. Теперь отправьте .ghupdate [коммит] для обновления сохраненным файлом."
-            if user_id in self.temp_update_reply
-            else f"Выбран файл: {path}. Теперь ответьте на это сообщение новым файлом и командой .ghupdate [коммит]."
-        )
+        alert_text = f"Выбран файл: {path}. Теперь ответьте на сообщение с новым файлом и командой .ghupdate [коммит]."
         await call.answer(alert_text, show_alert=True)
 
     @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок интерактивного удаления файла.")
@@ -1014,6 +1051,34 @@ class GitHubManagerMod(loader.Module):
 
         data = call.data
         if data == "ghfl_close":
+            await self._close_inline_message(call)
+            return
+
+        if data.startswith("ghfl_close:"):
+            payload = data.split(":", 1)[1]
+            chat_id = None
+            msg_id_raw = payload
+            if "|" in payload:
+                chat_id_raw, msg_id_raw = payload.rsplit("|", 1)
+                try:
+                    chat_id = int(chat_id_raw)
+                except (TypeError, ValueError):
+                    chat_id = None
+
+            try:
+                msg_id = int(msg_id_raw)
+            except (TypeError, ValueError):
+                msg_id = 0
+
+            with contextlib.suppress(Exception):
+                await call.answer()
+
+            chat_id = chat_id or self._extract_chat_id(call)
+            if self._client and chat_id and msg_id > 0:
+                with contextlib.suppress(Exception):
+                    await self._client.delete_messages(chat_id, msg_id)
+                    return
+
             await self._close_inline_message(call)
             return
 
