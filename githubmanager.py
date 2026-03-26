@@ -269,23 +269,59 @@ class GitHubManagerMod(loader.Module):
 
         return None
 
+    async def _delete_message_entity(self, entity: Any) -> bool:
+        """Пытается удалить message/callback entity несколькими способами."""
+
+        if not entity:
+            return False
+
+        with contextlib.suppress(Exception):
+            if hasattr(entity, "delete"):
+                await entity.delete()
+                return True
+
+        message = getattr(entity, "message", None)
+        with contextlib.suppress(Exception):
+            if message is not None and hasattr(message, "delete"):
+                await message.delete()
+                return True
+
+        chat_candidates = []
+        for candidate in (
+            getattr(entity, "chat_id", None),
+            getattr(message, "chat_id", None) if message is not None else None,
+            getattr(getattr(message, "chat", None), "id", None) if message is not None else None,
+            self._extract_chat_id(entity),
+        ):
+            if isinstance(candidate, int) and candidate not in chat_candidates:
+                chat_candidates.append(candidate)
+                if candidate > 0:
+                    chat_candidates.append(int(f"-100{candidate}"))
+
+        message_id = self._extract_message_id(entity)
+        if not message_id and message is not None:
+            message_id = self._extract_message_id(message)
+
+        if self._client and message_id:
+            for chat_id in chat_candidates:
+                with contextlib.suppress(Exception):
+                    await self._client.delete_messages(chat_id, message_id)
+                    return True
+
+        return False
+
     async def _close_inline_message(self, call: Message, fallback_text: str = "✔️ Меню закрыто."):
         """Пытается удалить inline-сообщение и только потом фолбэчит в edit."""
 
         with contextlib.suppress(Exception):
             await call.answer()
 
-        msg_id = self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call)
-        chat_id = self._extract_chat_id(call)
-
-        with contextlib.suppress(Exception):
-            if self._client and chat_id and msg_id:
-                await self._client.delete_messages(chat_id, msg_id)
-                return
-
-        with contextlib.suppress(Exception):
-            await call.delete()
+        if await self._delete_message_entity(getattr(call, "message", None)):
             return
+
+        with contextlib.suppress(Exception):
+            if await self._delete_message_entity(call):
+                return
 
         with contextlib.suppress(Exception):
             await call.edit(text=fallback_text, reply_markup=None)
@@ -869,11 +905,9 @@ class GitHubManagerMod(loader.Module):
                 })
             if nav_buttons:
                 buttons.append(nav_buttons)
-            current_chat_id = self._extract_chat_id(message) or 0
-            current_message_id = self._extract_message_id(getattr(message, "message", None)) or self._extract_message_id(message) or 0
             buttons.append([{
                 "text": self.strings("files_list_close"),
-                "data": f"ghfl_close:{current_chat_id}|{current_message_id}",
+                "data": "ghfl_close",
             }])
 
             await self._answer_or_edit(message, "\n".join(lines), reply_markup=buttons)
@@ -1050,36 +1084,14 @@ class GitHubManagerMod(loader.Module):
         """Обрабатывает кнопки пагинации для .ghfiles."""
 
         data = call.data
-        if data == "ghfl_close":
-            await self._close_inline_message(call)
-            return
-
-        if data.startswith("ghfl_close:"):
-            payload = data.split(":", 1)[1]
-            chat_id = None
-            msg_id_raw = payload
-            if "|" in payload:
-                chat_id_raw, msg_id_raw = payload.rsplit("|", 1)
-                try:
-                    chat_id = int(chat_id_raw)
-                except (TypeError, ValueError):
-                    chat_id = None
-
-            try:
-                msg_id = int(msg_id_raw)
-            except (TypeError, ValueError):
-                msg_id = 0
-
+        if data == "ghfl_close" or data.startswith("ghfl_close:"):
             with contextlib.suppress(Exception):
                 await call.answer()
-
-            chat_id = chat_id or self._extract_chat_id(call)
-            if self._client and chat_id and msg_id > 0:
-                with contextlib.suppress(Exception):
-                    await self._client.delete_messages(chat_id, msg_id)
-                    return
-
-            await self._close_inline_message(call)
+            with contextlib.suppress(Exception):
+                await call.edit(text="✔️ Меню закрыто.", reply_markup=None)
+                return
+            with contextlib.suppress(Exception):
+                await call.edit("✔️ Меню закрыто.", reply_markup=None)
             return
 
         if not data.startswith("ghfl_page:"):
