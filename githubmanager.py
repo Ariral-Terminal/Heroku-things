@@ -222,6 +222,58 @@ class GitHubManagerMod(loader.Module):
         # 3. Аварийный глубокий рекурсивный поиск
         return self._find_id_recursively(call, set())
 
+    def _extract_message_id(self, obj: Any) -> Optional[int]:
+        """Извлекает ID сообщения из Message/InlineCall-подобных объектов."""
+
+        if obj is None:
+            return None
+        if getattr(obj, "message_id", None):
+            return obj.message_id
+        if getattr(obj, "id", None):
+            return obj.id
+        message = getattr(obj, "message", None)
+        if message is not None:
+            if getattr(message, "message_id", None):
+                return message.message_id
+            if getattr(message, "id", None):
+                return message.id
+        return None
+
+    async def _close_inline_message(self, call: Message, fallback_text: str = "✔️ Меню закрыто."):
+        """Закрывает inline-сообщение через редактирование текущей формы."""
+
+        with contextlib.suppress(Exception):
+            await call.answer()
+
+        with contextlib.suppress(Exception):
+            await call.edit(text=fallback_text, reply_markup=None)
+            return
+
+        with contextlib.suppress(Exception):
+            await call.edit(fallback_text, reply_markup=None)
+            return
+
+        with contextlib.suppress(Exception):
+            msg_id = self._extract_message_id(getattr(call, "message", None)) or self._extract_message_id(call)
+            chat_id = getattr(call, "chat_id", None)
+            if self._client and chat_id and msg_id:
+                await self._client.delete_messages(chat_id, msg_id)
+                return
+
+    async def _answer_or_edit(self, entity: Message, text: str, reply_markup=None):
+        """Редактирует текущее сообщение, если возможно, иначе отправляет новый ответ."""
+
+        if hasattr(entity, "edit"):
+            with contextlib.suppress(Exception):
+                await entity.edit(text=text, reply_markup=reply_markup)
+                return
+
+            with contextlib.suppress(Exception):
+                await entity.edit(text, reply_markup=reply_markup)
+                return
+
+        await utils.answer(entity, text, reply_markup=reply_markup)
+
     # --- Конец Утилит ID ---
     
     @loader.command(
@@ -726,31 +778,31 @@ class GitHubManagerMod(loader.Module):
 
         await self._ensure_session()
         if not self.session:
-            await utils.answer(message, self.strings("no_config"))
+            await self._answer_or_edit(message, self.strings("no_config"))
             return
 
         per_page = self._get_files_per_list()
         if per_page <= 0:
-            await utils.answer(message, self.strings("files_list_bad_per_page"))
+            await self._answer_or_edit(message, self.strings("files_list_bad_per_page"))
             return
 
         try:
             normalized_path = self._normalize_repo_path(path)
             collected_files = await self._collect_repo_files(owner, repo, normalized_path)
             if collected_files is None:
-                await utils.answer(
+                await self._answer_or_edit(
                     message,
                     self.strings("files_list_path_error").format(path=utils.escape_html(normalized_path or "/")),
                 )
                 return
 
             if not collected_files:
-                await utils.answer(message, self.strings("files_list_empty"))
+                await self._answer_or_edit(message, self.strings("files_list_empty"))
                 return
 
             total_pages = max(1, (len(collected_files) + per_page - 1) // per_page)
             if page < 1 or page > total_pages:
-                await utils.answer(message, self.strings("files_list_bad_page"))
+                await self._answer_or_edit(message, self.strings("files_list_bad_page"))
                 return
 
             start = (page - 1) * per_page
@@ -789,12 +841,15 @@ class GitHubManagerMod(loader.Module):
                 })
             if nav_buttons:
                 buttons.append(nav_buttons)
-            buttons.append([{"text": self.strings("files_list_close"), "callback": self._ghfl_close_cb}])
+            buttons.append([{
+                "text": self.strings("files_list_close"),
+                "data": "ghfl_close",
+            }])
 
-            await utils.answer(message, "\n".join(lines), reply_markup=buttons)
+            await self._answer_or_edit(message, "\n".join(lines), reply_markup=buttons)
 
         except Exception as e:
-            await utils.answer(message, self.strings("internal_error").format(str(e)))
+            await self._answer_or_edit(message, self.strings("internal_error").format(str(e)))
             logger.exception(e)
 
     @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок списка репозиториев.")
@@ -809,10 +864,7 @@ class GitHubManagerMod(loader.Module):
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
 
-            try:
-                await call.delete()
-            except Exception:
-                await call.answer()
+            await self._close_inline_message(call)
             return
 
         if not data.startswith("ghm_set_"):
@@ -847,10 +899,7 @@ class GitHubManagerMod(loader.Module):
                 self.temp_update_path.pop(user_id, None)
                 self.temp_update_reply.pop(user_id, None)
 
-            try:
-                await call.delete()
-            except Exception:
-                await call.answer()
+            await self._close_inline_message(call)
             return
 
         if data.startswith("ghmu_dir:"):
@@ -898,10 +947,7 @@ class GitHubManagerMod(loader.Module):
         data = call.data
 
         if data == "ghmd_close":
-            try:
-                await call.delete()
-            except Exception:
-                await call.answer()
+            await self._close_inline_message(call)
             return
 
         owner = self.config["repo_owner"]
@@ -943,18 +989,15 @@ class GitHubManagerMod(loader.Module):
             path = data[len("ghmd_confirm:"):]
             await self._delete_file(call, owner, repo, path, f"Delete {path}")
 
-    async def _ghfl_close_cb(self, call):
-        try:
-            await call.answer()
-            await call.delete()
-        except Exception:
-            pass
-
     @loader.callback_handler(ru_doc="Обрабатывает пагинацию списка файлов репозитория.")
     async def ghfl_callback_handler(self, call: Message):
         """Обрабатывает кнопки пагинации для .ghfiles."""
 
         data = call.data
+        if data == "ghfl_close":
+            await self._close_inline_message(call)
+            return
+
         if not data.startswith("ghfl_page:"):
             return
 
