@@ -70,6 +70,7 @@ class GitHubManagerMod(loader.Module):
             "    - <code>repo_name</code>: Имя целевого репозитория (например, <code>userbot_files</code>).\n\n"
             "### 💾 Использование\n"
             "Команда: <code>ghupload</code> [сообщение коммита]\n"
+            "    или <code>ghupload -m \"сообщение коммита\"</code>\n"
             "<b>Действие:</b> Ответьте этой командой на сообщение с файлом.\n"
             "    - Файл будет загружен или обновлен (если уже существует).\n"
             "    - <b>[сообщение коммита]</b> — опционально. Если не указано, используется имя файла.\n\n"
@@ -347,13 +348,13 @@ class GitHubManagerMod(loader.Module):
 
 
     @loader.command(
-        ru_doc="[сообщение коммита] - Загружает файл из ответа. Использует оригинальное имя файла. Сообщение коммита опционально.",
-        en_doc="[commit message] - Uploads file from reply. Uses original file name. Commit message is optional."
+        ru_doc="[сообщение коммита] или -m <сообщение> - Загружает файл из ответа. Использует оригинальное имя файла.",
+        en_doc="[commit message] or -m <message> - Uploads file from reply. Uses original file name."
     )
     async def ghuploadcmd(self, message: Message):
         """Загрузка нового файла в GitHub repository."""
         
-        commit_message = utils.get_args_raw(message).strip()
+        commit_message = self._parse_commit_message(utils.get_args_raw(message))
         
         reply = await message.get_reply_message()
         if not reply or not reply.media:
@@ -367,7 +368,7 @@ class GitHubManagerMod(loader.Module):
             return
 
         if not commit_message:
-            commit_message = f"File upload: {utils.escape_html(file_path)}"
+            commit_message = f"File upload: {file_path}"
         
         await self._process_upload(message, reply, file_path, commit_message, is_update=False)
 
@@ -400,11 +401,11 @@ class GitHubManagerMod(loader.Module):
             # 1. Мы в режиме ожидания (пользователь выбрал файл, и теперь отвечает новым файлом)
             repo_path = self.temp_update_path[user_id]
             
-            commit_message = utils.get_args_raw(message).strip()
+            commit_message = self._parse_commit_message(utils.get_args_raw(message))
             
             # Сообщение коммита по умолчанию
             if not commit_message:
-                commit_message = f"File update: {utils.escape_html(repo_path)}"
+                commit_message = f"File update: {repo_path}"
 
             try:
                 # Выполняем обновление
@@ -417,10 +418,10 @@ class GitHubManagerMod(loader.Module):
 
         if not reply and stored_reply and user_id in self.temp_update_path:
             repo_path = self.temp_update_path[user_id]
-            commit_message = utils.get_args_raw(message).strip()
+            commit_message = self._parse_commit_message(utils.get_args_raw(message))
 
             if not commit_message:
-                commit_message = f"File update: {utils.escape_html(repo_path)}"
+                commit_message = f"File update: {repo_path}"
 
             try:
                 await self._process_upload(message, stored_reply, repo_path, commit_message, is_update=True)
@@ -442,7 +443,7 @@ class GitHubManagerMod(loader.Module):
 
             if not commit_message:
                 default_name = self._get_file_name(reply) or "новый файл"
-                commit_message = f"File update: {utils.escape_html(repo_path)} (from {default_name})"
+                commit_message = f"File update: {repo_path} (from {default_name})"
 
             try:
                 await self._process_upload(message, reply, repo_path, commit_message, is_update=True)
@@ -456,7 +457,7 @@ class GitHubManagerMod(loader.Module):
                 matches = await self._find_repo_matches_for_file(owner, repo, reply_file_name)
                 if len(matches) == 1:
                     repo_path = matches[0]
-                    commit_message = f"File update: {utils.escape_html(repo_path)}"
+                    commit_message = f"File update: {repo_path}"
                     status_message = await utils.answer(
                         message,
                         self.strings("update_auto_found").format(path=utils.escape_html(repo_path)),
@@ -570,6 +571,24 @@ class GitHubManagerMod(loader.Module):
 
         processed_path = WINDOWS_DRIVE_PREFIX_REGEX.sub("", path.strip())
         return processed_path.lstrip("/")
+
+    def _parse_commit_message(self, raw_args: str) -> str:
+        """Извлекает commit message из аргументов команды."""
+
+        commit_message = raw_args.strip()
+        for prefix in ("-m ", "--message "):
+            if commit_message.startswith(prefix):
+                commit_message = commit_message[len(prefix):].strip()
+                break
+
+        if (
+            len(commit_message) >= 2
+            and commit_message[0] == commit_message[-1]
+            and commit_message[0] in {"'", '"'}
+        ):
+            commit_message = commit_message[1:-1].strip()
+
+        return commit_message
 
     async def _read_github_error(self, response: aiohttp.ClientResponse) -> str:
         """Безопасно достает сообщение об ошибке из ответа GitHub API."""
@@ -843,7 +862,7 @@ class GitHubManagerMod(loader.Module):
                 buttons.append(nav_buttons)
             buttons.append([{
                 "text": self.strings("files_list_close"),
-                "data": "ghfl_close",
+                "action": "close",
             }])
 
             await self._answer_or_edit(message, "\n".join(lines), reply_markup=buttons)
