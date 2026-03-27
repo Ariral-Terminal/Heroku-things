@@ -28,6 +28,8 @@ __version__ = (1, 0, 2)
 from aiogram.types import Message as AiogramMessage
 from aiogram.types import CallbackQuery as AiogramCallbackQuery
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, InputMediaPhoto
+from telethon import functions
+from telethon.tl.types import PeerUser
 from ..inline.types import InlineCall # type: ignore
 from html import escape
 from .. import loader, utils
@@ -155,12 +157,77 @@ class AuroraFeedBackMod(loader.Module):
 
     async def on_dlmod(self, client, db):
         self.db.set("AuroraFeedBackMod", "ban_list", [])
+        self.db.set("AuroraFeedBackMod", "known_users", {})
 
     async def client_ready(self, client, db):
+        self._client = client
         self.forwarding_enabled = {}
         self._ban_list = self.db.get("AuroraFeedBackMod", "ban_list")
+        self._known_users = self.db.get("AuroraFeedBackMod", "known_users", {}) or {}
         self._name = utils.escape_html((await client.get_me()).first_name)
         self.db.set("AuroraFeedBackMod", "state", "done")
+
+    def _remember_user(self, user_id, username=None):
+        if not username:
+            return
+
+        user_key = str(user_id)
+        username = username.lstrip("@")
+        cached = self._known_users.get(user_key, {})
+
+        if cached.get("username") == username:
+            return
+
+        self._known_users[user_key] = {"username": username}
+        self.db.set("AuroraFeedBackMod", "known_users", self._known_users)
+
+    def _add_feedback_ban(self, user_id):
+        if user_id in self._ban_list:
+            return False
+
+        self._ban_list.append(user_id)
+        self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
+        return True
+
+    def _remove_feedback_ban(self, user_id):
+        if user_id not in self._ban_list:
+            return False
+
+        self._ban_list.remove(user_id)
+        self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
+        return True
+
+    async def _set_account_block(self, user_id, block=True):
+        candidates = []
+        user_data = self._known_users.get(str(user_id), {})
+        username = user_data.get("username")
+
+        if username:
+            candidates.append(f"@{username}")
+
+        candidates.extend([user_id, PeerUser(user_id)])
+
+        peer = None
+        for candidate in candidates:
+            try:
+                peer = await self._client.get_input_entity(candidate)
+                break
+            except Exception:
+                continue
+
+        if peer is None:
+            return False
+
+        try:
+            request = (
+                functions.contacts.BlockRequest(id=peer)
+                if block
+                else functions.contacts.UnblockRequest(id=peer)
+            )
+            await self._client(request)
+            return True
+        except Exception:
+            return False
 
     @loader.command(
         ru_doc="- Получить ссылку на feedback бота",
@@ -186,16 +253,20 @@ class AuroraFeedBackMod(loader.Module):
         if not user_id and message.is_reply:
             reply = await message.get_reply_message()
             user_id = reply.from_id.user_id
+            self._remember_user(
+                user_id,
+                getattr(getattr(reply, "sender", None), "username", None),
+            )
         # чот старое
         if not user_id:
             await utils.answer(message, self.strings["not_arg"])
         else:
             user_id = int(user_id) 
-            if user_id not in self._ban_list:
-                self._ban_list.append(user_id)
-                self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
+            if self._add_feedback_ban(user_id):
+                await self._set_account_block(user_id, block=True)
                 await utils.answer(message, self.strings["successfully_ban"])
             else:
+                await self._set_account_block(user_id, block=True)
                 await utils.answer(message, self.strings["already_banned"])
 
     @loader.command(
@@ -212,21 +283,27 @@ class AuroraFeedBackMod(loader.Module):
         if not user_id and message.is_reply:
             reply = await message.get_reply_message()
             user_id = reply.from_id.user_id
+            self._remember_user(
+                user_id,
+                getattr(getattr(reply, "sender", None), "username", None),
+            )
          # чот старое
         if not user_id:
             await utils.answer(message, self.strings["not_arg"])
         else:
             user_id = int(user_id)
-            if user_id in self._ban_list:
-                self._ban_list.remove(user_id)
-                self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
+            if self._remove_feedback_ban(user_id):
+                await self._set_account_block(user_id, block=False)
                 await utils.answer(message, self.strings["successfully_unban"])
             else:
+                await self._set_account_block(user_id, block=False)
                 await utils.answer(message, self.strings["not_in_ban"]) 
 
     async def aiogram_watcher(self, message: AiogramMessage):
         if self.config["mode"] is False:
             return
+
+        self._remember_user(message.from_user.id, message.from_user.username)
     
         if message.from_user.id in list(self.db.get("AuroraFeedBackMod", "ban_list")):
             return
@@ -271,10 +348,18 @@ class AuroraFeedBackMod(loader.Module):
         WriteInPM =f'<b><a href="tg://user?id={user_id}">✏️Write in PM</a></b>'
         custom_text = f"{self.strings['new_m']} {escape(message.from_user.first_name)}:\n\n{escape(original_text) if original_text is not None else {self.strings['not_text']}}\n\nUserID: {message.from_user.id}\n{WriteInPM}"
 
-        reply_markup = InlineKeyboardMarkup()
-        reply_markup.add(InlineKeyboardButton(text="📃 Reply", callback_data=f"reply_{user_id}")) if message.from_user.id != self._tg_id else None
-        reply_markup.add(InlineKeyboardButton(text="🔐 Ban", callback_data=f"ban_{user_id}"))
-        reply_markup.add(InlineKeyboardButton(text="🗑️ Delete", callback_data=f"MessageDelete"))
+        buttons = []
+        if message.from_user.id != self._tg_id:
+            buttons.append(
+                [InlineKeyboardButton(text="📃 Reply", callback_data=f"reply_{user_id}")]
+            )
+        buttons.extend(
+            [
+                [InlineKeyboardButton(text="🔐 Ban", callback_data=f"ban_{user_id}")],
+                [InlineKeyboardButton(text="🗑️ Delete", callback_data="MessageDelete")],
+            ]
+        )
+        reply_markup = InlineKeyboardMarkup(inline_keyboard=buttons)
     
         await self.inline.bot.send_message(self.tg_id, custom_text, reply_markup=reply_markup)
         await self.inline.bot.send_message(message.from_user.id, f'{self.strings["successfully_send"]}')
@@ -289,25 +374,46 @@ class AuroraFeedBackMod(loader.Module):
             return
         if call.data.startswith('ban_'):
             user_id = int(call.data.split('_')[1])
-            self._ban_list.append(user_id)
-            self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
-            reply_markup = InlineKeyboardMarkup()
-            reply_markup.add(InlineKeyboardButton(text="🔓 Unban", callback_data=f"unban_{user_id}"))
+            self._add_feedback_ban(user_id)
+            await self._set_account_block(user_id, block=True)
+            reply_markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔓 Unban", callback_data=f"unban_{user_id}"
+                        )
+                    ]
+                ]
+            )
             await self.inline.bot.send_message(self.tg_id, f'{self.strings["successfully_ban"]} ({user_id})', reply_markup=reply_markup)
             return
         if call.data.startswith('unban_'):
             user_id = int(call.data.split('_')[1])
-            self._ban_list.remove(user_id)
-            self.db.set("AuroraFeedBackMod", "ban_list", self._ban_list)
-            reply_markup = InlineKeyboardMarkup()
-            reply_markup.add(InlineKeyboardButton(text="🔐 Ban", callback_data=f"ban_{user_id}"))
+            self._remove_feedback_ban(user_id)
+            await self._set_account_block(user_id, block=False)
+            reply_markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="🔐 Ban", callback_data=f"ban_{user_id}"
+                        )
+                    ]
+                ]
+            )
             await self.inline.bot.send_message(self.tg_id, f'{self.strings["successfully_unban"]} ({user_id})', reply_markup=reply_markup)
             return
         if call.data.startswith("reply"):
             user_id = int(call.data.split('_')[1])
             self.db.set("AuroraFeedBackMod", "state", f"waiting_{user_id}_{call.message.message_id}")
-            reply_markup = InlineKeyboardMarkup()
-            reply_markup.add(InlineKeyboardButton(text="❌ Cancel", callback_data=f"cancel_reply"))
+            reply_markup = InlineKeyboardMarkup(
+                inline_keyboard=[
+                    [
+                        InlineKeyboardButton(
+                            text="❌ Cancel", callback_data="cancel_reply"
+                        )
+                    ]
+                ]
+            )
             await self.inline.bot.send_message(self.tg_id, f'{self.strings["waiting_answer"]}', reply_markup=reply_markup)   
         if call.data == "cancel_reply":
             self.db.set("AuroraFeedBackMod", "state", "done")
