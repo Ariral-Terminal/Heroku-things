@@ -20,6 +20,7 @@ import json
 import mimetypes
 import re
 from typing import Optional, Any
+from urllib.parse import quote
 
 from .. import loader, utils
 from herokutl.types import Message
@@ -103,6 +104,11 @@ class GitHubManagerMod(loader.Module):
         "get_fetching": "⏳ Получаю файл <code>{path}</code> из репозитория <code>{owner}/{repo}</code>...",
         "get_not_file": "❌ <b>Ошибка:</b> Путь <code>{path}</code> не указывает на файл в репозитории.",
         "get_send_failed": "❌ <b>Ошибка:</b> Не удалось отправить файл: {}",
+        "raw_no_query": "❌ <b>Ошибка:</b> Укажите имя файла или путь в репозитории.",
+        "raw_fetching": "⏳ Ищу raw-ссылку для <code>{query}</code> в репозитории <code>{owner}/{repo}</code>...",
+        "raw_not_found": "❌ <b>Файл не найден:</b> <code>{query}</code>",
+        "raw_ambiguous": "⚠️ <b>Найдено несколько совпадений для <code>{query}</code>:</b>\n{matches}",
+        "raw_success": "🔗 <b>Raw-ссылка:</b>\n<code>{path}</code>\n{url}",
     }
 
     def __init__(self):
@@ -137,6 +143,7 @@ class GitHubManagerMod(loader.Module):
         self._client = client
         self._db = db
         self.session: Optional[aiohttp.ClientSession] = None
+        self._default_branches: dict[tuple[str, str], str] = {}
         self.temp_update_path = {}
         # Pre-stored reply message when user calls .ghupdate as reply to a file
         self.temp_update_reply: dict = {}
@@ -568,6 +575,34 @@ class GitHubManagerMod(loader.Module):
         await self._send_repo_file(status_message, owner, repo, path)
 
     @loader.command(
+        ru_doc="<имя_или_путь> - Находит файл в репозитории и возвращает raw-ссылку на него.",
+        en_doc="<file_name_or_path> - Finds a file in the repository and returns its raw link."
+    )
+    async def ghrawcmd(self, message: Message):
+        """Возвращает raw-ссылку на файл из репозитория."""
+        if not self.config["github_token"]:
+            return await utils.answer(message, self.strings("no_config"))
+
+        owner = self.config["repo_owner"]
+        repo = self.config["repo_name"]
+        if not owner or not repo:
+            return await utils.answer(message, self.strings("no_repo_set"))
+
+        query = utils.get_args_raw(message).strip()
+        if not query:
+            return await utils.answer(message, self.strings("raw_no_query"))
+
+        status_message = await utils.answer(
+            message,
+            self.strings("raw_fetching").format(
+                query=utils.escape_html(query),
+                owner=utils.escape_html(owner),
+                repo=utils.escape_html(repo),
+            ),
+        )
+        await self._send_repo_raw_link(status_message, owner, repo, query)
+
+    @loader.command(
         ru_doc="<путь> [коммит] или без аргументов — удалить файл из репозитория.",
         en_doc="<path> [commit] or no args - delete a file from the repository."
     )
@@ -873,6 +908,7 @@ class GitHubManagerMod(loader.Module):
             end = start + per_page
             page_files = collected_files[start:end]
             truncated = total_pages > page
+            default_branch = await self._get_default_branch(owner, repo)
 
             lines = [
                 self.strings("files_list_header").format(
@@ -886,7 +922,15 @@ class GitHubManagerMod(loader.Module):
             ]
 
             for index, file_path in enumerate(page_files, start=start + 1):
-                lines.append(f"{index}. <code>{utils.escape_html(file_path)}</code>")
+                escaped_path = utils.escape_html(file_path)
+                raw_url = self._build_raw_url(owner, repo, default_branch, file_path)
+                if raw_url:
+                    lines.append(
+                        f'{index}. <code>{escaped_path}</code> '
+                        f'[<a href="{utils.escape_html(raw_url)}">raw</a>]'
+                    )
+                else:
+                    lines.append(f"{index}. <code>{escaped_path}</code>")
 
             if truncated:
                 lines.append(self.strings("files_list_truncated"))
@@ -915,6 +959,43 @@ class GitHubManagerMod(loader.Module):
         except Exception as e:
             await self._answer_or_edit(message, self.strings("internal_error").format(str(e)))
             logger.exception(e)
+
+    def _build_raw_url(self, owner: str, repo: str, branch: Optional[str], path: str) -> Optional[str]:
+        """Строит raw-ссылку на файл, если известна default branch."""
+
+        if not branch:
+            return None
+
+        return (
+            "https://raw.githubusercontent.com/"
+            f"{quote(owner, safe='')}/{quote(repo, safe='')}/{quote(branch, safe='')}/"
+            f"{quote(path, safe='/')}"
+        )
+
+    async def _get_default_branch(self, owner: str, repo: str) -> Optional[str]:
+        """Получает и кэширует default branch репозитория."""
+
+        cache_key = (owner, repo)
+        if cache_key in self._default_branches:
+            return self._default_branches[cache_key]
+
+        await self._ensure_session()
+        if not self.session:
+            return None
+
+        url = f"https://api.github.com/repos/{owner}/{repo}"
+        async with self.session.get(url) as response:
+            if response.status != 200:
+                return None
+
+            payload = await response.json()
+
+        default_branch = payload.get("default_branch")
+        if isinstance(default_branch, str) and default_branch:
+            self._default_branches[cache_key] = default_branch
+            return default_branch
+
+        return None
 
     @loader.callback_handler(ru_doc="Обрабатывает нажатия кнопок списка репозиториев.")
     async def ghm_callback_handler(self, call: Message):
@@ -1221,6 +1302,76 @@ class GitHubManagerMod(loader.Module):
             return base64.b64decode(content)
 
         raise ValueError("GitHub API did not return file bytes")
+
+    async def _get_repo_file_data(self, owner: str, repo: str, path: str) -> Optional[dict]:
+        """Получает метаданные файла из GitHub Contents API."""
+
+        await self._ensure_session()
+        if not self.session:
+            return None
+
+        normalized_path = self._normalize_repo_path(path)
+        url = GITHUB_API_URL.format(owner=owner, repo=repo, path=normalized_path)
+
+        async with self.session.get(url) as response:
+            if response.status != 200:
+                return None
+
+            payload = await response.json()
+            if isinstance(payload, dict) and payload.get("type") == "file":
+                return payload
+
+        return None
+
+    async def _send_repo_raw_link(self, message: Message, owner: str, repo: str, query: str):
+        """Находит файл по имени или пути и отправляет raw-ссылку."""
+
+        matches = await self._find_repo_matches_for_file(owner, repo, query)
+        if not matches:
+            await utils.answer(
+                message,
+                self.strings("raw_not_found").format(query=utils.escape_html(query)),
+            )
+            return
+
+        if len(matches) > 1:
+            match_lines = "\n".join(
+                f"• <code>{utils.escape_html(path)}</code>"
+                for path in matches[:10]
+            )
+            await utils.answer(
+                message,
+                self.strings("raw_ambiguous").format(
+                    query=utils.escape_html(query),
+                    matches=match_lines,
+                ),
+            )
+            return
+
+        resolved_path = matches[0]
+        file_data = await self._get_repo_file_data(owner, repo, resolved_path)
+        if not file_data:
+            await utils.answer(
+                message,
+                self.strings("raw_not_found").format(query=utils.escape_html(query)),
+            )
+            return
+
+        download_url = file_data.get("download_url")
+        if not download_url:
+            await utils.answer(
+                message,
+                self.strings("get_not_file").format(path=utils.escape_html(resolved_path)),
+            )
+            return
+
+        await utils.answer(
+            message,
+            self.strings("raw_success").format(
+                path=utils.escape_html(resolved_path),
+                url=utils.escape_html(download_url),
+            ),
+        )
 
     async def _send_repo_file(self, message: Message, owner: str, repo: str, path: str):
         """Получает файл из GitHub и отправляет его документом с подробной информацией."""
